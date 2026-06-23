@@ -35,7 +35,7 @@ from timm import utils
 from timm.data import create_dataset, create_loader, create_naflex_loader, resolve_data_config, \
     Mixup, FastCollateMixup, AugMixDataset
 from timm.layers import convert_splitbn_model, convert_sync_batchnorm, set_fast_norm
-from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy
+from timm.loss import JsdCrossEntropy, SoftTargetCrossEntropy, BinaryCrossEntropy, LabelSmoothingCrossEntropy, LaneLoss
 from timm.models import create_model, safe_model_name
 from timm.optim import create_optimizer_v2, optimizer_kwargs
 from timm.scheduler import create_scheduler_v2, scheduler_kwargs
@@ -458,7 +458,7 @@ def _parse_args():
 
 
 def main():
-    utils.setup_default_logging()
+    utils.setup_default_logging(log_path='./training.log')
     args, args_text = _parse_args()
 
     if args.device_modules:
@@ -554,6 +554,7 @@ def main():
             f'Model {safe_model_name(args.model)} created, param count:{sum([m.numel() for m in model.parameters()])}')
 
     data_config = resolve_data_config(vars(args), model=model, verbose=utils.is_primary(args))
+    args.data_config = data_config
 
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
@@ -629,39 +630,59 @@ def main():
     else:
         input_img_mode = args.input_img_mode
 
-    dataset_train = create_dataset(
-        args.dataset,
-        root=args.data_dir,
-        split=args.train_split,
-        is_training=True,
-        class_map=args.class_map,
-        download=args.dataset_download,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        repeats=args.epoch_repeats,
-        input_img_mode=input_img_mode,
-        input_key=args.input_key,
-        target_key=args.target_key,
-        num_samples=args.train_num_samples,
-        trust_remote_code=args.dataset_trust_remote_code,
-    )
-
-    dataset_eval = None
-    if args.val_split:
-        dataset_eval = create_dataset(
+    if args.dataset == "lane":
+        from timm.data.lane_dataset import LaneDataset
+        dataset_train = LaneDataset(
+                root=args.data_dir,
+                split=args.train_split,
+                train_height=data_config["input_size"][1],
+                train_width=data_config["input_size"][2],
+                **vars(args),
+            )
+    else:
+        dataset_train = create_dataset(
             args.dataset,
             root=args.data_dir,
-            split=args.val_split,
-            is_training=False,
+            split=args.train_split,
+            is_training=True,
             class_map=args.class_map,
             download=args.dataset_download,
             batch_size=args.batch_size,
+            seed=args.seed,
+            repeats=args.epoch_repeats,
             input_img_mode=input_img_mode,
             input_key=args.input_key,
             target_key=args.target_key,
-            num_samples=args.val_num_samples,
+            num_samples=args.train_num_samples,
             trust_remote_code=args.dataset_trust_remote_code,
         )
+
+    dataset_eval = None
+    if args.val_split:
+        if args.dataset == "lane":
+            from timm.data.lane_dataset import LaneDataset
+            dataset_eval = LaneDataset(
+                    root=args.data_dir,
+                    split=args.val_split,
+                    train_height=data_config["input_size"][1],
+                    train_width=data_config["input_size"][2],
+                    **vars(args),
+                )
+        else:
+            dataset_eval = create_dataset(
+                args.dataset,
+                root=args.data_dir,
+                split=args.val_split,
+                is_training=False,
+                class_map=args.class_map,
+                download=args.dataset_download,
+                batch_size=args.batch_size,
+                input_img_mode=input_img_mode,
+                input_key=args.input_key,
+                target_key=args.target_key,
+                num_samples=args.val_num_samples,
+                trust_remote_code=args.dataset_trust_remote_code,
+            )
 
     # create data loaders w/ augmentation pipeline
     train_interpolation = args.train_interpolation
@@ -828,7 +849,9 @@ def main():
             )
 
     # setup loss function
-    if args.jsd_loss:
+    if args.dataset == "lane":
+        train_loss_fn = LaneLoss()
+    elif args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
     elif mixup_active:
@@ -854,7 +877,10 @@ def main():
     else:
         train_loss_fn = nn.CrossEntropyLoss()
     train_loss_fn = train_loss_fn.to(device=device)
-    validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
+    if args.dataset == "lane":
+        validate_loss_fn = LaneLoss().to(device=device)
+    else:
+        validate_loss_fn = nn.CrossEntropyLoss().to(device=device)
 
     # Setup training task (classification or distillation)
     if args.kd_model_name is not None:
@@ -1092,30 +1118,51 @@ def main():
                 continue
 
             if loader_eval is not None:
-                eval_metrics = validate(
-                    eval_model,
-                    loader_eval,
-                    validate_loss_fn,
-                    args,
-                    device=device,
-                    amp_autocast=amp_autocast,
-                    model_dtype=model_dtype,
-                )
-
-                ema_model = task.get_trainable_module(ema=True)
-                if ema_model is not None and not args.model_ema_force_cpu:
-                    if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
-                        utils.distribute_bn(ema_model, args.world_size, args.dist_bn == 'reduce')
-
-                    ema_eval_metrics = validate(
-                        task.get_eval_model(ema=True),
+                if args.dataset == "lane":
+                    eval_metrics = validate_lane(
+                        eval_model,
                         loader_eval,
                         validate_loss_fn,
                         args,
                         device=device,
                         amp_autocast=amp_autocast,
-                        log_suffix=' (EMA)',
+                        model_dtype=model_dtype,
                     )
+                else:
+                    eval_metrics = validate(
+                        eval_model,
+                        loader_eval,
+                        validate_loss_fn,
+                        args,
+                        device=device,
+                        amp_autocast=amp_autocast,
+                        model_dtype=model_dtype,
+                    )
+
+                ema_model = task.get_trainable_module(ema=True)
+                if ema_model is not None and not args.model_ema_force_cpu:
+                    if args.distributed and args.dist_bn in ('broadcast', 'reduce'):
+                        utils.distribute_bn(ema_model, args.world_size, args.dist_bn == 'reduce')
+                    if args.dataset == "lane":
+                        ema_eval_metrics = validate_lane(
+                            task.get_eval_model(ema=True),
+                            loader_eval,
+                            validate_loss_fn,
+                            args,
+                            device=device,
+                            amp_autocast=amp_autocast,
+                            log_suffix=' (EMA)',
+                        )
+                    else:
+                        ema_eval_metrics = validate(
+                            task.get_eval_model(ema=True),
+                            loader_eval,
+                            validate_loss_fn,
+                            args,
+                            device=device,
+                            amp_autocast=amp_autocast,
+                            log_suffix=' (EMA)',
+                        )
                     eval_metrics = ema_eval_metrics
             else:
                 eval_metrics = None
@@ -1224,7 +1271,14 @@ def train_one_epoch(
             accum_steps = last_accum_steps
 
         if not args.prefetcher:
-            input, target = input.to(device=device, dtype=model_dtype), target.to(device=device)
+            input = input.to(device=device, dtype=model_dtype)
+            if isinstance(target, dict):
+                target = {
+                    k: v.to(device=device)
+                    for k, v in target.items()
+                }
+            else:
+                target = target.to(device=device)
             if mixup_fn is not None:
                 input, target = mixup_fn(input, target)
         if args.channels_last:
@@ -1461,6 +1515,96 @@ def validate(
                 )
 
     metrics = OrderedDict([('loss', losses_m.avg), ('top1', top1_m.avg), ('top5', top5_m.avg)])
+
+    return metrics
+
+def validate_lane(
+        model,
+        loader,
+        loss_fn,
+        args,
+        device=torch.device('cuda'),
+        amp_autocast=suppress,
+        model_dtype=None,
+        log_suffix=''
+):
+    batch_time_m        = utils.AverageMeter()
+    losses_m            = utils.AverageMeter()
+
+    counts = {
+        'll_lane_correct': 0.0, 'll_lane_total': 0.0,
+        'll_attr_tp': 0.0, 'll_attr_fp': 0.0, 'll_attr_fn': 0.0, 'll_attr_tn': 0.0,
+        'row_tp': 0.0, 'row_fp': 0.0, 'row_fn': 0.0,
+        'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
+    }
+
+    model.eval()
+
+    end = time.time()
+    last_idx = len(loader) - 1
+    with torch.inference_mode():
+        for batch_idx, (input, target) in enumerate(loader):
+            last_batch = batch_idx == last_idx
+            if not args.prefetcher:
+                input = input.to(device=device, dtype=model_dtype)
+                if isinstance(target, dict):
+                    target = {
+                        k: v.to(device=device)
+                        for k, v in target.items()
+                    }
+                else:
+                    target = target.to(device=device)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+
+            with amp_autocast():
+                output = model(input)
+                loss = loss_fn(output, target)[0]
+            
+            batch_size = input.shape[0]
+
+            train_height    = int(int(args.data_config["input_size"][1]) / args.top_crop)
+            train_width     = args.data_config["input_size"][2]
+
+            test_result = utils.lane_test(output, target, args.row_anchor, args.col_anchor, train_width, train_height)
+
+            if args.distributed:
+                reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
+                for k in test_result:
+                    t = torch.tensor(test_result[k],device=device)
+                    test_result[k] = utils.reduce_tensor(t,args.world_size).item()
+            else:
+                reduced_loss = loss.data
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            elif device.type == "npu":
+                torch.npu.synchronize()
+            
+            losses_m.update(reduced_loss.item(), batch_size)
+            for k in counts:
+                counts[k] += test_result[k]
+
+            batch_time_m.update(time.time() - end)
+            end = time.time()
+            if utils.is_primary(args) and batch_idx !=0 and (last_batch or batch_idx % args.log_interval == 0):
+                tmp = utils.lane_compute_metrics(counts)
+                log_name = 'Test' + log_suffix
+                _logger.info(
+                    f'********************************************************************\n'
+                    f'{log_name}: [{batch_idx:>4d}/{last_idx}]\n'
+                    f'Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})\n'
+                    f'Loss: {losses_m.val:>7.3f} ({losses_m.avg:>6.3f})\n'
+                    f'LaneAcc: {tmp["ll_lane_acc"]:.6f}\n'
+                    f'LaneAttrF1: {tmp["ll_attr_f1"]:.6f}\n'
+                    f'RowF1: {tmp["row_f1"]:.6f}\n'
+                    f'ColF1: {tmp["col_f1"]:.6f}\n'
+                    f'lane_total_f1: {tmp["lane_total_f1"]:.6f}\n'
+                    f'********************************************************************\n'
+                )
+
+    metrics = utils.lane_compute_metrics(counts)
+    metrics['loss'] = losses_m.avg
 
     return metrics
 

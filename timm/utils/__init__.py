@@ -14,3 +14,4 @@ from .model import unwrap_model, get_state_dict, freeze, unfreeze, reparameteriz
 from .model_ema import ModelEma, ModelEmaV2, ModelEmaV3
 from .random import random_seed
 from .summary import update_summary, get_outdir
+from .lane_inference import lane_test, lane_compute_metrics

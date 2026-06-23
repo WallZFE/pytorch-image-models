@@ -28,7 +28,7 @@ from timm.layers import apply_test_time_pool, set_fast_norm
 from timm.models import create_model, load_checkpoint, is_model, list_models
 from timm.utils import accuracy, AverageMeter, natural_key, setup_default_logging, set_jit_fuser, \
     decay_batch_step, check_batch_size_retry, ParseKwargs, reparameterize_model
-
+from timm.loss import LaneLoss
 
 try:
     from functorch.compile import memory_efficient_fusion
@@ -45,6 +45,17 @@ except ImportError:
     has_sklearn = False
 
 _logger = logging.getLogger('validate')
+
+TOP_CROP = 0.8
+ROW_ANCHOR = [73,  79,  86,  93, 100, 107, 114, 121, 128, 135,
+        142, 149, 156, 163, 170, 177, 184, 191, 198, 205,
+        212, 219, 226, 233, 240, 247, 254, 261, 268, 275,
+        282, 289, 296, 303, 310, 317, 324, 331, 338, 345,
+        352, 359]
+COL_ANCHOR = [2, 20, 40, 60, 80, 100, 120, 140, 160, 180,
+        200, 220, 240, 260, 280, 300, 320, 340, 360, 380,
+        400, 420, 440, 460, 480, 500, 520, 540, 560, 580,
+        600, 620, 638]
 
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Validation')
@@ -172,14 +183,99 @@ parser.add_argument('--naflex-max-seq-len', type=int, default=576,
                    help='Fixed maximum sequence length for NaFlex loader (validation)')
 
 
+def validate_lane(model,
+        loader,
+        criterion,
+        args,
+        device=torch.device('cuda'),
+        amp_autocast=suppress,
+        model_dtype=None):
+    
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+
+    counts = {
+        'll_lane_correct': 0.0, 'll_lane_total': 0.0,
+        'll_attr_tp': 0.0, 'll_attr_fp': 0.0, 'll_attr_fn': 0.0, 'll_attr_tn': 0.0,
+        'row_tp': 0.0, 'row_fp': 0.0, 'row_fn': 0.0,
+        'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
+    }
+
+    model.eval()
+    with torch.inference_mode():
+        # warmup, reduce variability of first batch time, especially for comparing torchscript vs non
+        if not args.naflex_loader:
+            input = torch.randn((args.batch_size,) + tuple(args.data_config['input_size'])).to(device=device, dtype=model_dtype)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+            with amp_autocast():
+                model(input)
+
+        end = time.time()
+        last_idx = len(loader) - 1
+        for batch_idx, (input, target) in enumerate(loader):
+            last_batch = batch_idx == last_idx
+            if args.no_prefetcher:
+                input = input.to(device=device, dtype=model_dtype)
+                if isinstance(target, dict):
+                    target = {
+                        k: v.to(device=device)
+                        for k, v in target.items()
+                    }
+                else:
+                    target = target.to(device=device)
+            if args.channels_last:
+                input = input.contiguous(memory_format=torch.channels_last)
+
+            # compute output
+            with amp_autocast():
+                output = model(input)
+                loss = criterion(output, target)[0]
+
+            # measure accuracy and record loss
+            batch_size = input.shape[0]
+
+            train_height    = int(int(args.data_config["input_size"][1]) / TOP_CROP)
+            train_width     = args.data_config["input_size"][2]
+
+            test_result = utils.lane_test(output, target, ROW_ANCHOR, COL_ANCHOR, train_width, train_height)
+
+            losses.update(loss.item(), batch_size)
+            for k in counts:
+                counts[k] += test_result[k]
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            rate_avg = batch_size / batch_time.avg
+            end = time.time()
+
+            if batch_idx !=0 and (last_batch or batch_idx % args.log_freq == 0):
+                tmp = utils.lane_compute_metrics(counts)
+                _logger.info(
+                    f'Test: [{batch_idx:>4d}/{len(loader)}]\n'
+                    f'Time: {batch_time.val:.3f}s ({batch_time.avg:.3f}s, {rate_avg:>7.2f}/s)\n'
+                    f'Loss: {losses.val:>7.4f} ({losses.avg:>6.4f})\n'
+                    f'LaneAcc: {tmp["ll_lane_acc"]:.4f}\n'
+                    f'LaneAttrF1: {tmp["ll_attr_f1"]:.4f}\n'
+                    f'RowF1: {tmp["row_f1"]:.4f}\n'
+                    f'ColF1: {tmp["col_f1"]:.4f}\n'
+                    f'lane_total_f1: {tmp["lane_total_f1"]:.4f}\n'
+                )
+
+    metrics = utils.lane_compute_metrics(counts)
+    metrics['loss'] = losses.avg
+
+    return metrics
+
 def validate(args):
     # might as well try to validate something
     args.pretrained = args.pretrained or not args.checkpoint
     args.prefetcher = not args.no_prefetcher
 
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
 
     device = torch.device(args.device)
 
@@ -233,7 +329,7 @@ def validate(args):
         args.num_classes = model.num_classes
 
     if args.checkpoint:
-        load_checkpoint(model, args.checkpoint, args.use_ema)
+        load_checkpoint(model, args.checkpoint, args.use_ema, weights_only=False)
 
     if args.reparam:
         model = reparameterize_model(model)
@@ -247,6 +343,7 @@ def validate(args):
         use_test_size=not args.use_train_size,
         verbose=True,
     )
+    args.data_config = data_config
     test_time_pool = False
     if args.test_pool:
         model, test_time_pool = apply_test_time_pool(model, data_config)
@@ -268,27 +365,43 @@ def validate(args):
     if args.num_gpu > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(args.num_gpu)))
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    if args.dataset == "lane":
+        criterion = LaneLoss().to(device=device)
+    else:
+        criterion = nn.CrossEntropyLoss().to(device)
 
     root_dir = args.data or args.data_dir
     if args.input_img_mode is None:
         input_img_mode = 'RGB' if data_config['input_size'][0] == 3 else 'L'
     else:
         input_img_mode = args.input_img_mode
-    dataset = create_dataset(
-        root=root_dir,
-        name=args.dataset,
-        split=args.split,
-        download=args.dataset_download,
-        load_bytes=args.tf_preprocessing,
-        class_map=args.class_map,
-        num_samples=args.num_samples,
-        input_key=args.input_key,
-        input_img_mode=input_img_mode,
-        target_key=args.target_key,
-        trust_remote_code=args.dataset_trust_remote_code,
-        seed=args.seed,
-    )
+
+    if args.dataset == "lane":
+        from timm.data.lane_dataset import LaneDataset
+        dataset = LaneDataset(
+                root=root_dir,
+                row_anchor=ROW_ANCHOR,
+                col_anchor=COL_ANCHOR,
+                top_crop=TOP_CROP,
+                train_height=data_config["input_size"][1],
+                train_width=data_config["input_size"][2],
+                **vars(args),
+            )
+    else:
+        dataset = create_dataset(
+            root=root_dir,
+            name=args.dataset,
+            split=args.split,
+            download=args.dataset_download,
+            load_bytes=args.tf_preprocessing,
+            class_map=args.class_map,
+            num_samples=args.num_samples,
+            input_key=args.input_key,
+            input_img_mode=input_img_mode,
+            target_key=args.target_key,
+            trust_remote_code=args.dataset_trust_remote_code,
+            seed=args.seed,
+        )
 
     if args.valid_labels:
         with open(args.valid_labels, 'r') as f:
@@ -344,6 +457,17 @@ def validate(args):
             tf_preprocessing=args.tf_preprocessing,
         )
 
+    if args.dataset == "lane":
+        results = validate_lane(
+            model,
+            loader,
+            criterion,
+            args,
+            device=device,
+            amp_autocast=amp_autocast,
+            model_dtype=model_dtype,
+        )
+        return results
     batch_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
@@ -489,7 +613,7 @@ _NON_IN1K_FILTERS = ['*_in21k', '*_in22k', '*in12k', '*_dino', '*fcmae', '*seer'
 
 
 def main():
-    setup_default_logging()
+    setup_default_logging(log_path='./validateing.log')
     args = parser.parse_args()
     model_cfgs = []
     model_names = []

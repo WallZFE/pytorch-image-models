@@ -94,9 +94,16 @@ class ClassificationTask(TrainingTask):
                 - 'output': Model logits
         """
         output = self.trainable_module(input)
-        loss = self.criterion(output, target)
+        loss_result = self.criterion(output, target)
+
+        if isinstance(loss_result, tuple):
+            loss, loss_items = loss_result
+        else:
+            loss = loss_result
+            loss_items = None
 
         return {
             'loss': loss,
+            'loss_items': loss_items,
             'output': output,
         }

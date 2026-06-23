@@ -72,40 +72,96 @@ def main():
     print("==> Creating PyTorch {} model".format(args.model))
     # NOTE exportable=True flag disables autofn/jit scripted activations and uses Conv2dSameExport layers
     # for models using SAME padding
-    model = timm.create_model(
-        args.model,
-        num_classes=args.num_classes,
-        in_chans=3,
-        pretrained=args.pretrained,
-        checkpoint_path=args.checkpoint,
-        exportable=True,
-    )
+    if args.model == "lane_net_18":
+        model = timm.create_model(
+            args.model,
+            num_classes=args.num_classes,
+            in_chans=3,
+            pretrained=args.pretrained,
+            exportable=True,
+        )
+        if args.checkpoint:
+            import torch
+            print("==> Loading checkpoint from {}".format(args.checkpoint))
+            checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+            
+            if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                elif 'model_state_dict' in checkpoint:
+                    state_dict = checkpoint['model_state_dict']
+                else:
+                    state_dict = checkpoint
+            else:
+                state_dict = checkpoint
+                
+            cleaned_state_dict = {}
+            for k, v in state_dict.items():
+                name = k[7:] if k.startswith('module.') else k
+                cleaned_state_dict[name] = v
+                
+            model.load_state_dict(cleaned_state_dict, strict=False)
+            print("==> Checkpoint loaded successfully.")
 
+        if hasattr(model, 'export_onnx'):
+            model.export_onnx = True
+            print("==> Set model.export_onnx = True for tuple output.")
+    else:
+        model = timm.create_model(
+            args.model,
+            num_classes=args.num_classes,
+            in_chans=3,
+            pretrained=args.pretrained,
+            checkpoint_path=args.checkpoint,
+            exportable=True,
+        )
+    print(model)
+    
     if args.reparam:
         model = reparameterize_model(model)
 
     if args.input_size is not None:
         assert len(args.input_size) == 3, 'input-size should be N H W (channels, height, width)'
-        input_size = args.input_size
+        input_size = tuple(args.input_size) 
     elif args.img_size is not None:
         input_size = (3, args.img_size, args.img_size)
     else:
         input_size = None
 
-    onnx_export(
-        model,
-        args.output,
-        opset=args.opset,
-        dynamic_size=args.dynamic_size,
-        aten_fallback=args.aten_fallback,
-        keep_initializers=args.keep_init,
-        check_forward=args.check_forward,
-        training=args.training,
-        verbose=args.verbose,
-        use_dynamo=args.dynamo,
-        input_size=input_size,
-        batch_size=args.batch_size,
-    )
+    if args.model == "lane_net_18": 
+        onnx_export(
+            model,
+            args.output,
+            opset=args.opset,
+            dynamic_size=args.dynamic_size,
+            aten_fallback=args.aten_fallback,
+            keep_initializers=args.keep_init,
+            check_forward=args.check_forward,
+            training=args.training,
+            verbose=args.verbose,
+            use_dynamo=args.dynamo,
+            input_size=input_size,
+            batch_size=args.batch_size,
+            input_names = ["images"],
+            output_names = ["loc_row", "loc_col", "exist_row", "exist_col", "lane_label"],
+        )
+    else:
+        onnx_export(
+            model,
+            args.output,
+            opset=args.opset,
+            dynamic_size=args.dynamic_size,
+            aten_fallback=args.aten_fallback,
+            keep_initializers=args.keep_init,
+            check_forward=args.check_forward,
+            training=args.training,
+            verbose=args.verbose,
+            use_dynamo=args.dynamo,
+            input_size=input_size,
+            batch_size=args.batch_size,
+        )
 
 
 if __name__ == '__main__':
