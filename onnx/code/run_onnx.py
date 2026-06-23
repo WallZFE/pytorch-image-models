@@ -1,7 +1,6 @@
 import os
 import glob
 import cv2
-import tqdm
 import argparse
 import numpy as np
 import onnxruntime as ort
@@ -10,6 +9,7 @@ import json
 import math
 from natsort import natsorted
 from PIL import Image, ImageDraw, ImageFont
+from tqdm import tqdm
 
 ROW_COORDS = [73,  79,  86,  93, 100, 107, 114, 121, 128, 135,
             142, 149, 156, 163, 170, 177, 184, 191, 198, 205,
@@ -21,8 +21,8 @@ COL_COORDS = [2, 20, 40, 60, 80, 100, 120, 140, 160, 180,
             400, 420, 440, 460, 480, 500, 520, 540, 560, 580,
             600, 620, 638]
 
-MEAN = [0.485, 0.456, 0.406]
-STD = [0.229, 0.224, 0.225]
+MEAN = [0.5, 0.5, 0.5]
+STD = [0.5, 0.5, 0.5]
 
 # 车道线属性标签
 lane_label_index_dic = ["单", "多", "白", "黄", "实线", "虚线", "实虚线", "虚实线"]
@@ -89,11 +89,37 @@ def collect_images(data_root, mode='video', test_txt_path=None):
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
         print(f"扫描目录 {data_root} 下的所有图片...")
 
+        json_files_to_delete = []
+
         for file_path in glob.glob(os.path.join(data_root, "**", "*"), recursive=True):
-            if os.path.splitext(file_path)[1].lower() in image_extensions:
+            ext = os.path.splitext(file_path)[1].lower()
+            
+            if ext in image_extensions:
                 image_paths.append(file_path)
+            elif mode == 'json' and ext == '.json':
+                json_files_to_delete.append(file_path)
 
         print(f"✅ 共找到 {len(image_paths)} 张图片")
+
+        # ================= JSON 模式专属：删除 JSON 文件 =================
+        if mode == 'json':
+            if json_files_to_delete:
+                print(f"🗑️  [JSON模式] 发现 {len(json_files_to_delete)} 个 JSON 文件，正在删除...")
+                
+                deleted_count = 0
+                failed_count = 0
+                
+                for json_path in tqdm(json_files_to_delete, desc="删除JSON文件", ncols=80):
+                    try:
+                        os.remove(json_path)
+                        deleted_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"\n⚠️ 删除失败: {json_path} - {e}")
+                        
+                print(f"✅ JSON 文件清理完成: 成功删除 {deleted_count} 个, 失败 {failed_count} 个")
+            else:
+                print("ℹ️  [JSON模式] 目录下未找到任何 JSON 文件")
 
     return image_paths
 
@@ -300,7 +326,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='ONNX车道线检测推理')
     parser.add_argument('--mode', type=str, default='eval', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
     parser.add_argument('--onnx_model', type=str, default="../model/output_model.onnx", help='ONNX模型文件路径')
-    parser.add_argument('--demo_data_root', type=str, default="../../../data/model_use/TUSimple", help='图片目录路径')
+    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose/images", help='图片目录路径')
     parser.add_argument('--test_txt', type=str, default="../../../data/model_use/TUSimple/test.txt", help='eval模式下使用的 test.txt 图片列表文件路径')
     parser.add_argument('--cache_path', type=str, default="../../../data/model_use/TUSimple/tusimple_anno_cache_test.json", help='测试集GT标注缓存JSON路径 (eval模式需要)')
     parser.add_argument('--train_height', type=int, default=288, help='模型输入高度')
@@ -385,7 +411,7 @@ def find_output_key(pred, target_key):
 
 def pred2coords(pred, local_width=1, original_image_widths=None, original_image_heights=None, predict_next_num=1, straight_error=2.0):
     """
-    预测结果转坐标（支持batch，numpy版本）
+    预测结果转坐标
     :param pred: ONNX输出的字典
     :param original_image_widths/heights: 每个样本的原始图片尺寸（列表）
     :return: all_coords, all_lane_labels
@@ -551,13 +577,13 @@ def process_single_image_json(img_path, coords, lane_labels, img_h, img_w, need_
 
 
 def run_json_mode(session, input_name, output_names, image_list, args):
-    """JSON模式：对每张图片生成坐标JSON文件"""
+    """JSON模式: 对每张图片生成坐标JSON文件"""
     batch_size = args.batch_size
 
     total_batches = math.ceil(len(image_list) / batch_size)
     print(f'[JSON模式] 共 {len(image_list)} 张图片, {total_batches} 个batch')
 
-    for batch_start in tqdm.tqdm(range(0, len(image_list), batch_size), total=total_batches, desc='处理中'):
+    for batch_start in tqdm(range(0, len(image_list), batch_size), total=total_batches, desc='处理中'):
         batch_paths = image_list[batch_start:batch_start + batch_size]
 
         # 预处理batch
@@ -667,7 +693,7 @@ def run_video_mode(session, input_name, output_names, image_list, args):
     vout = cv2.VideoWriter(video_path, fourcc, args.fps, (img_w, img_h))
     print(f'[视频模式] 共 {len(image_list)} 帧, 保存到 {video_path}')
 
-    for batch_start in tqdm.tqdm(range(0, len(image_list), batch_size), total=math.ceil(len(image_list) / batch_size), desc='生成视频'):
+    for batch_start in tqdm(range(0, len(image_list), batch_size), total=math.ceil(len(image_list) / batch_size), desc='生成视频'):
         batch_paths = image_list[batch_start:batch_start + batch_size]
 
         batch_numpys = []
@@ -1278,7 +1304,7 @@ def run_eval_mode(session, input_name, output_names, image_list, args):
     valid_count = 0
     total_num = len(valid_image_list)
 
-    for batch_start in tqdm.tqdm(range(0, total_num, batch_size), total=total_batches, desc='评估中'):
+    for batch_start in tqdm(range(0, total_num, batch_size), total=total_batches, desc='评估中'):
         raw_batch_paths = valid_image_list[batch_start:batch_start + batch_size]
 
         batch_numpys, batch_paths, original_widths, original_heights = [], [], [], []

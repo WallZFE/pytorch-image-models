@@ -149,8 +149,8 @@ input_size: [3, 288, 640]
 # mean: null
 # mean: [0.485, 0.456, 0.406]
 #
-mean: [0.485, 0.456, 0.406]
-std: [0.229, 0.224, 0.225]
+mean: [0.5, 0.5, 0.5]
+std: [0.5, 0.5, 0.5]
 
 
 
@@ -1385,7 +1385,7 @@ wandb_project: "lane_detect"
 # wandb_tags: []
 # wandb_tags: ["baseline", "resnet50"]
 #
-wandb_tags: []
+wandb_tags: ["augment"]
 
 
 
