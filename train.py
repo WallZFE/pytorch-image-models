@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
@@ -850,7 +850,7 @@ def main():
 
     # setup loss function
     if args.dataset == "lane":
-        train_loss_fn = LaneLoss()
+        train_loss_fn = LaneLoss(False)
     elif args.jsd_loss:
         assert num_aug_splits > 1  # JSD only valid with aug splits set
         train_loss_fn = JsdCrossEntropy(num_splits=num_aug_splits, smoothing=args.smoothing)
@@ -1238,6 +1238,9 @@ def train_one_epoch(
         num_updates_total=None,
         naflex_mode=False,
 ):
+    metric_sums = defaultdict(float)  # 用于累加各项 loss 的总和
+    num_batches = 0                   # 记录 batch 数量
+    
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
             loader.mixup_enabled = False
@@ -1370,6 +1373,12 @@ def train_one_epoch(
             else:
                 loss, result = _forward()
                 _backward(loss)
+                
+        if result.get("loss_items") is not None:
+            for k, v in result["loss_items"].items():
+                val = v.item() if isinstance(v, torch.Tensor) else float(v)
+                metric_sums[k] += val       
+        num_batches += 1
 
         losses_m.update(loss.item() * accum_steps, batch_size)
         update_sample_count += global_batch_size
@@ -1440,7 +1449,15 @@ def train_one_epoch(
         # synchronize avg loss, each process keeps its own running avg
         loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
         loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
-    return OrderedDict([('loss', loss_avg)])
+
+    num_batches = max(num_batches, 1) 
+    
+    train_metrics = OrderedDict()
+    train_metrics['loss'] = loss_avg
+    for k, v in metric_sums.items():
+        train_metrics[k] = v / num_batches
+    
+    return train_metrics
 
 
 def validate(

@@ -118,8 +118,11 @@ class LaneDataset(data.Dataset):
 
         # 读取坐标
         infos = self.cached_points[img_name]
-        # points shape: (num_lanes, num_points, 2) -> 通常是 (4, N, 2)
+        # points shape: (num_lanes, num_points, 2) -> 通常是 (4, N, 2) 并且y从小到大排序
         points = np.array(infos["points"]).astype(np.float32)
+        sort_indices = np.argsort(points[:, :, 1], axis=1)
+        points = np.take_along_axis(points, sort_indices[:, :, np.newaxis], axis=1)
+
         lane_label = np.array(infos["lane_label"]).astype(np.float32)
 
         img_raw = img.copy()
@@ -156,67 +159,60 @@ class LaneDataset(data.Dataset):
             # points_row_extend shape: (H_row, num_lanes)
             points_row_extend = self._extend(points_row[:, :, 0]).transpose(0, 1) 
         else:
+            # Row Coords (2, H_row, 2)
+            row_coords = torch.from_numpy(points_row[[1, 2], :, :]).float()
+            invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] > img_w)
+            row_coords[..., 0] = torch.where(invalid_x, torch.full_like(row_coords[..., 0], -10000.0), row_coords[..., 0])
+            target["row_coords"] = row_coords
+
             # points_row_extend shape: (H_row, num_lanes)
             points_row_extend = torch.from_numpy(points_row[:, :, 0]).transpose(0, 1) 
 
-        labels_row = (points_row_extend / img_w * (self.num_cell_row - 1)).long()
+        labels_row = (points_row_extend / img_w * (self.num_cell_row - 1)).round().long()
         labels_row[(points_row_extend < 0) | (points_row_extend > img_w)] = -1
         labels_row[(labels_row < 0) | (labels_row > (self.num_cell_row - 1))] = -1
 
         # labels_row 对应车道线 1, 2
         # labels_row shape: (H_row, num_lanes) → 取第 1, 2 列
         for lane_idx in [1, 2]:
-            if torch.all(labels_row[:, lane_idx] == -1):
+            if torch.all(labels_row[:, lane_idx] < 0):
                 lane_label[lane_idx] = 0.0   # 整个 (X, 8) 子维度全部置零
 
 
         # col 列
+        # points_col shape: (num_lanes, H_col, 2)
         points_col = self._my_interp_cpu(points, self.interp_loc_col, direction=1)
+        if self.split != 'train':
+            # Col Coords (2, H_col, 2)
+            col_coords = torch.from_numpy(points_col[[0, 3], :, :]).float()
+            invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] > img_h)
+            col_coords[..., 1] = torch.where(invalid_y, torch.full_like(col_coords[..., 1], -10000.0), col_coords[..., 1])
+            target["col_coords"] = col_coords
+
         # (H_col, num_lanes)
         points_col_y = torch.from_numpy(points_col[:, :, 1]).transpose(0, 1)
 
-        labels_col = (points_col_y / img_h * (self.num_cell_col - 1)).long()
+        labels_col = (points_col_y / img_h * (self.num_cell_col - 1)).round().long()
         labels_col[(points_col_y < 0) | (points_col_y > img_h)] = -1
         labels_col[(labels_col < 0) | (labels_col > (self.num_cell_col - 1))] = -1
 
         # labels_col 对应车道线 0, 3
         # labels_col shape: (H_col, num_lanes) → 取第 0, 3 列
         for lane_idx in [0, 3]:
-            if torch.all(labels_col[:, lane_idx] == -1):
+            if torch.all(labels_col[:, lane_idx] < 0):
                 lane_label[lane_idx] = 0.0
 
-
-        labels_row_float = points_row_extend / img_w
-        labels_row_float[(labels_row_float < 0) | (labels_row_float > 1)] = -1
+        labels_row_float = points_row_extend / img_w * (self.num_cell_row - 1)
+        labels_row_float[(labels_row_float < 0) | (labels_row_float > (self.num_cell_row - 1))] = -1
         
-        labels_col_float = points_col_y / img_h
-        labels_col_float[(labels_col_float < 0) | (labels_col_float > 1)] = -1
+        labels_col_float = points_col_y / img_h * (self.num_cell_col - 1)
+        labels_col_float[(labels_col_float < 0) | (labels_col_float > (self.num_cell_col - 1))] = -1
 
         target["labels_row"] = labels_row
         target["labels_col"] = labels_col
         target["labels_row_float"] = labels_row_float
         target["labels_col_float"] = labels_col_float
         target["lane_label"] = torch.from_numpy(lane_label)
-
-        if self.split != 'train':
-            # 1. Row Coords (选取 lane_idx = [1, 2])
-            pts_row = points[[1, 2], :, :]  # (2, num_points, 2)
-            interp_row = self._my_interp_cpu(pts_row, self.interp_loc_row, direction=0) # (2, H_row, 2)
-            row_coords = torch.from_numpy(interp_row).float()
-            
-            invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] > img_w)
-            row_coords[..., 0] = torch.where(invalid_x, torch.full_like(row_coords[..., 0], -10000.0), row_coords[..., 0])
-            
-            # 2. Col Coords (选取 lane_idx = [0, 3])
-            pts_col = points[[0, 3], :, :]  # (2, num_points, 2)
-            interp_col = self._my_interp_cpu(pts_col, self.interp_loc_col, direction=1) # (2, H_col, 2)
-            col_coords = torch.from_numpy(interp_col).float()
-            
-            invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] > img_h)
-            col_coords[..., 1] = torch.where(invalid_y, torch.full_like(col_coords[..., 1], -10000.0), col_coords[..., 1])
-
-            target["row_coords"] = row_coords
-            target["col_coords"] = col_coords
 
         return img, target
 

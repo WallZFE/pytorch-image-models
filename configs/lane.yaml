@@ -300,7 +300,7 @@ batch_size: 16
 # epochs: 300
 # epochs: 100
 #
-epochs: 120
+epochs: 150
 
 
 
@@ -1243,7 +1243,7 @@ decay_rate: 0.1
 # 示例：
 # checkpoint_hist: 10
 #
-checkpoint_hist: 5
+checkpoint_hist: 3
 
 
 
@@ -1385,7 +1385,7 @@ wandb_project: "lane_detect"
 # wandb_tags: []
 # wandb_tags: ["baseline", "resnet50"]
 #
-wandb_tags: ["augment"]
+wandb_tags: ["坐标四舍五入 loss重构 修改推理参数"]
 
 
 
