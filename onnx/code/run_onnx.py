@@ -324,7 +324,7 @@ def bce_with_logits_loss_np(logits, targets):
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='ONNX车道线检测推理')
-    parser.add_argument('--mode', type=str, default='eval', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
+    parser.add_argument('--mode', type=str, default='video', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
     parser.add_argument('--onnx_model', type=str, default="../model/output_model.onnx", help='ONNX模型文件路径')
     parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose/images", help='图片目录路径')
     parser.add_argument('--test_txt', type=str, default="../../../data/model_use/TUSimple/test.txt", help='eval模式下使用的 test.txt 图片列表文件路径')
@@ -409,7 +409,7 @@ def find_output_key(pred, target_key):
 
 # ==================== 核心推理后处理 ====================
 
-def pred2coords(pred, local_width=1, original_image_widths=None, original_image_heights=None, predict_next_num=1, straight_error=2.0):
+def pred2coords(pred, local_width=5, original_image_widths=None, original_image_heights=None, predict_next_num=1, straight_error=2.0):
     """
     预测结果转坐标
     :param pred: ONNX输出的字典
@@ -465,7 +465,7 @@ def pred2coords(pred, local_width=1, original_image_widths=None, original_image_
 
                         raw_vals = loc_row[b, all_ind, k, i]  # (local_width*2+1,)
                         probs = softmax_np(raw_vals)
-                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) + 0.5
+                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) #+ 0.5
                         out_tmp = out_tmp / (num_grid_row - 1) * img_w
                         y_val = int(ROW_COORDS[k] / 360.0 * img_h)
                         tmp.append((int(out_tmp), y_val))
@@ -492,7 +492,7 @@ def pred2coords(pred, local_width=1, original_image_widths=None, original_image_
 
                         raw_vals = loc_col[b, all_ind, k, i]
                         probs = softmax_np(raw_vals)
-                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) + 0.5
+                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) #+ 0.5
                         out_tmp = out_tmp / (num_grid_col - 1) * img_h
                         x_val = int(COL_COORDS[k] / 640.0 * img_w)
                         tmp.append((x_val, int(out_tmp)))

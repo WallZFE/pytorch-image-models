@@ -37,14 +37,14 @@ class LaneLoss(nn.Module):
 
         self.mean_loss_row = MeanLoss()
         self.mean_loss_col = MeanLoss()
-        self.mean_loss_row_weight = 0.05
-        self.mean_loss_col_weight = 0.05
+        self.mean_loss_row_weight = 0.5
+        self.mean_loss_col_weight = 0.5
 
         if testing_mode:
             self.lane_attr_loss = nn.BCEWithLogitsLoss()
         else:
             self.lane_attr_loss = LaneAttributeLoss(num_attrs=8, gamma=1.0, reg_weight=0.1)
-        self.lane_attr_loss_weight = 1.0
+        self.lane_attr_loss_weight = 0.5
 
     def forward(self, pred, target):
         cls_out_ext_label = (target['labels_row'] != -1).long()

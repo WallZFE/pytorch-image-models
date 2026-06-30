@@ -68,25 +68,40 @@ class LaneDataset(data.Dataset):
         self.aug = A.Compose([
                 A.Affine(
                     scale={"x": (0.9, 1.1), "y": (0.9, 1.1)},
-                    rotate=(-6, 6),
-                    translate_px={"x": (-15, 15), "y": (-35, 35)},
+                    rotate=(-10, 10),
+                    translate_px={"x": (-15, 15), "y": (-45, 45)},
                     fit_output=False,
                     p=0.6,
                 ),
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.2,
-                    contrast_limit=0.2,
-                    p=0.2,
+                A.Perspective(
+                    scale=(0.02, 0.05),
+                    p=0.25,
                 ),
+                A.OpticalDistortion(
+                    distort_limit=0.03,
+                    p=0.15,
+                ),
+
+                # 光照增强
+                A.OneOf([
+                    A.RandomBrightnessContrast(),
+                    A.CLAHE(),
+                ], p=0.3),
+
+                # 颜色增强
                 A.HueSaturationValue(
                     hue_shift_limit=10,
                     sat_shift_limit=20,
                     val_shift_limit=10,
-                    p=0.15,
+                    p=0.2,
                 ),
-                A.CLAHE(clip_limit=2.0, p=0.15),
-                A.GaussNoise(noise_scale_factor=0.1, p=0.15),
-                A.MotionBlur(blur_limit=5, p=0.15),
+
+                # 模糊/噪声
+                A.OneOf([
+                    A.MotionBlur(blur_limit=5),
+                    A.GaussNoise(noise_scale_factor=0.1),
+                ], p=0.25),
+
                 A.CoarseDropout(
                     num_holes_range=(1, 5),
                     hole_height_range=(20, 60),

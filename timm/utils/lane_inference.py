@@ -36,7 +36,7 @@ def process_row_lanes(loc_row, valid_row, max_idx_row, lane_indices, row_anchor_
 
     logits = loc_row[b_e, all_ind, h_e, l_e]
     weights = logits.softmax(dim=-1)
-    refined = (weights * all_ind.float()).sum(dim=-1) + 0.5
+    refined = (weights * all_ind.float()).sum(dim=-1)# + 0.5
 
     x = refined / (num_grid_row - 1) * img_w
     x = x.permute(0, 2, 1)
@@ -84,7 +84,7 @@ def process_col_lanes(loc_col, valid_col, max_idx_col, lane_indices, col_anchor_
 
     logits = loc_col[b_e, all_ind, h_e, l_e]
     weights = logits.softmax(dim=-1)
-    refined = (weights * all_ind.float()).sum(dim=-1) + 0.5
+    refined = (weights * all_ind.float()).sum(dim=-1) #+ 0.5
 
     y = refined / (num_grid_col - 1) * img_h
     y = y.permute(0, 2, 1)
@@ -212,7 +212,7 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
     g_inv_c = (g_col_y <= -2.0)
     
     both_valid_c = (~p_inv_c) & (~g_inv_c)
-    diff_ok_c = torch.abs(p_col_y - g_col_y) <= math.ceil(train_height * 0.03)
+    diff_ok_c = torch.abs(p_col_y - g_col_y) <= math.ceil(train_height * 0.01)
     
     col_tp = (both_valid_c & diff_ok_c).sum().float()
     col_fp = ((~p_inv_c) & g_inv_c).sum().float()
