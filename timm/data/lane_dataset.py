@@ -73,14 +73,14 @@ class LaneDataset(data.Dataset):
                     fit_output=False,
                     p=0.6,
                 ),
-                A.Perspective(
-                    scale=(0.02, 0.05),
-                    p=0.25,
-                ),
-                A.OpticalDistortion(
-                    distort_limit=0.03,
-                    p=0.15,
-                ),
+                # A.Perspective(
+                #     scale=(0.02, 0.05),
+                #     p=0.25,
+                # ),
+                # A.OpticalDistortion(
+                #     distort_limit=0.03,
+                #     p=0.15,
+                # ),
 
                 # 光照增强
                 A.OneOf([
