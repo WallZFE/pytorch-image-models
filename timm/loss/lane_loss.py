@@ -17,7 +17,7 @@ class LaneLoss(nn.Module):
         self.cls_loss_weight = 1.0
 
         self.cls_loss_col = SoftmaxFocalLoss(2, ignore_lb=-1)
-        self.cls_loss_col_weight = 1.0
+        self.cls_loss_col_weight = 0.3
 
 
         self.relation_loss = ParsingRelationLoss()
@@ -33,22 +33,22 @@ class LaneLoss(nn.Module):
             self.cls_ext = FocalLabelSmoothLoss(alpha=0.75, gamma=2.0, label_smoothing=0.05)
             self.cls_ext_col = FocalLabelSmoothLoss(alpha=0.75, gamma=2.0, label_smoothing=0.05)
         self.cls_ext_weight = 1.0
-        self.cls_ext_col_weight = 1.0
+        self.cls_ext_col_weight = 0.0
 
         self.mean_loss_row = MeanLoss()
         self.mean_loss_col = MeanLoss()
-        self.mean_loss_row_weight = 0.5
-        self.mean_loss_col_weight = 0.5
+        self.mean_loss_row_weight = 1.0
+        self.mean_loss_col_weight = 0.3
 
         if testing_mode:
             self.lane_attr_loss = nn.BCEWithLogitsLoss()
         else:
-            self.lane_attr_loss = LaneAttributeLoss(num_attrs=8, gamma=1.0, reg_weight=0.1)
-        self.lane_attr_loss_weight = 0.5
+            self.lane_attr_loss = LaneAttributeLoss(num_attrs=8)
+        self.lane_attr_loss_weight = 1.0
 
     def forward(self, pred, target):
         cls_out_ext_label = (target['labels_row'] != -1).long()
-        cls_out_col_ext_label = (target['labels_col'] != -1).long()
+        # cls_out_col_ext_label = (target['labels_col'] != -1).long()
 
         total_loss = torch.zeros((), device=pred['loc_row'].device)
         loss_items = {}
@@ -80,10 +80,10 @@ class LaneLoss(nn.Module):
             loss_items['cls_ext'] = loss_cur.detach()
             total_loss += loss_cur * self.cls_ext_weight
 
-        if self.cls_ext_col_weight != 0:
-            loss_cur = self.cls_ext_col(pred['exist_col'], cls_out_col_ext_label)
-            loss_items['cls_ext_col'] = loss_cur.detach()
-            total_loss += loss_cur * self.cls_ext_col_weight
+        # if self.cls_ext_col_weight != 0:
+        #     loss_cur = self.cls_ext_col(pred['exist_col'], cls_out_col_ext_label)
+        #     loss_items['cls_ext_col'] = loss_cur.detach()
+        #     total_loss += loss_cur * self.cls_ext_col_weight
 
 
 
@@ -151,7 +151,7 @@ class FocalLabelSmoothLoss(nn.Module):
         return loss.mean()  
 
 class LaneAttributeLoss(nn.Module):
-    def __init__(self, num_attrs=8, gamma=1.0, reg_weight=0.1):
+    def __init__(self, num_attrs=8, gamma=0.7, reg_weight=0.05):
         super().__init__()
         self.num_attrs = num_attrs
         self.gamma = gamma       # Focal loss 的 gamma 参数，0 表示退化为普通 BCE
@@ -160,7 +160,7 @@ class LaneAttributeLoss(nn.Module):
         # 记录历史正样本比例，用于平滑动态权重（防止某个batch碰巧没有某属性导致除零）
         self.register_buffer('running_pos_ratio', torch.ones(num_attrs) * 0.1)
         self.register_buffer('update_count', torch.tensor(0, dtype=torch.long)) # 用于冷启动
-        self.momentum = 0.9 # 动量系数
+        self.momentum = 0.7 # 动量系数
 
     def forward(self, pred_attr, target_attr):
         """
@@ -243,7 +243,7 @@ class LaneAttributeLoss(nn.Module):
         # 既然存在的车道线必定有 3 个 1，那么概率和应该趋近于 3.0
         # 使用 Smooth L1 或 L1 惩罚偏离 3.0 的程度
         target_sum = valid_target.sum(dim=-1) 
-        loss_reg = F.l1_loss(sum_probs, target_sum)
+        loss_reg = F.mse_loss(sum_probs, target_sum)
 
         # ==========================================
         # 综合 Loss

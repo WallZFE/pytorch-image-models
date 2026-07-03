@@ -1552,7 +1552,7 @@ def validate_lane(
         'll_lane_correct': 0.0, 'll_lane_total': 0.0,
         'll_attr_tp': 0.0, 'll_attr_fp': 0.0, 'll_attr_fn': 0.0, 'll_attr_tn': 0.0,
         'row_tp': 0.0, 'row_fp': 0.0, 'row_fn': 0.0,
-        'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
+        # 'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
     }
 
     model.eval()
@@ -1615,7 +1615,7 @@ def validate_lane(
                     f'LaneAcc: {tmp["ll_lane_acc"]:.6f}\n'
                     f'LaneAttrF1: {tmp["ll_attr_f1"]:.6f}\n'
                     f'RowF1: {tmp["row_f1"]:.6f}\n'
-                    f'ColF1: {tmp["col_f1"]:.6f}\n'
+                    # f'ColF1: {tmp["col_f1"]:.6f}\n'
                     f'lane_total_f1: {tmp["lane_total_f1"]:.6f}\n'
                     f'********************************************************************\n'
                 )

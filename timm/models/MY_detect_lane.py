@@ -53,7 +53,7 @@ class ParsingNetHead(nn.Module):
         self.dim1 = num_grid_row * num_cls_row * num_lane_on_row  # loc_row
         self.dim2 = num_grid_col * num_cls_col * num_lane_on_col  # loc_col
         self.dim3 = 2 * num_cls_row * num_lane_on_row            # exist_row
-        self.dim4 = 2 * num_cls_col * num_lane_on_col            # exist_col
+        # self.dim4 = 2 * num_cls_col * num_lane_on_col            # exist_col
         self.dim5 = 4 * 8                                          # lane_label
         
         # Shared feature processing
@@ -68,7 +68,7 @@ class ParsingNetHead(nn.Module):
         self.loc_row_head = nn.Linear(mlp_mid_dim, self.dim1)
         self.loc_col_head = nn.Linear(mlp_mid_dim, self.dim2)
         self.exist_row_head = nn.Linear(mlp_mid_dim, self.dim3)
-        self.exist_col_head = nn.Linear(mlp_mid_dim, self.dim4)
+        # self.exist_col_head = nn.Linear(mlp_mid_dim, self.dim4)
         self.lane_label_head = nn.Linear(mlp_mid_dim, self.dim5)
         
         # Initialize weights
@@ -85,7 +85,7 @@ class ParsingNetHead(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
     
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, x: torch.Tensor, export_onnx: bool = False) -> Dict[str, torch.Tensor]:
         """
         Args:
             x: Input features of shape (B, C)
@@ -109,17 +109,24 @@ class ParsingNetHead(nn.Module):
         exist_row = self.exist_row_head(feat)
         exist_row = exist_row.view(-1, 2, self.num_cls_row, self.num_lane_on_row)
         
-        exist_col = self.exist_col_head(feat)
-        exist_col = exist_col.view(-1, 2, self.num_cls_col, self.num_lane_on_col)
+        # exist_col = self.exist_col_head(feat)
+        # exist_col = exist_col.view(-1, 2, self.num_cls_col, self.num_lane_on_col)
         
         lane_label = self.lane_label_head(feat)
         lane_label = lane_label.view(-1, 4, 8)
+
+        if export_onnx:
+            return {
+                'loc_row': loc_row,
+                'exist_row': exist_row,
+                'lane_label': lane_label,
+            }
         
         return {
             'loc_row': loc_row,
             'loc_col': loc_col,
             'exist_row': exist_row,
-            'exist_col': exist_col,
+            # 'exist_col': exist_col,
             'lane_label': lane_label,
         }
 
@@ -146,10 +153,10 @@ class ParsingNet(nn.Module):
         self,
         backbone: str = 'resnet50',
         num_grid_row: int = 100,
-        num_cls_row: int = 42,
+        num_cls_row: int = 58,
         num_lane_on_row: int = 4,
         num_grid_col: int = 100,
-        num_cls_col: int = 33,
+        num_cls_col: int = 65,
         num_lane_on_col: int = 4,
         input_height: int = 288,
         input_width: int = 640,
@@ -275,14 +282,14 @@ class ParsingNet(nn.Module):
         fea = fea.flatten(1)
         
         # Parsing head outputs multi-task predictions
-        pred_dict = self.parsing_head(fea)
+        pred_dict = self.parsing_head(fea, export_onnx=self.export_onnx)
 
         if self.export_onnx:
             return (
                 pred_dict['loc_row'],
-                pred_dict['loc_col'],
+                # pred_dict['loc_col'],
                 pred_dict['exist_row'],
-                pred_dict['exist_col'],
+                # pred_dict['exist_col'],
                 pred_dict['lane_label']
             )
         

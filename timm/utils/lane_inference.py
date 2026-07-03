@@ -102,12 +102,12 @@ def pred2coords(pred, row_anchor, col_anchor, image_widths, image_heights, local
     device = pred['loc_row'].device
     B = pred['loc_row'].shape[0]
     num_grid_row = pred['loc_row'].shape[1]
-    num_grid_col = pred['loc_col'].shape[1]
+    # num_grid_col = pred['loc_col'].shape[1]
     H_row = len(row_anchor)
-    H_col = len(col_anchor)
+    # H_col = len(col_anchor)
 
     row_anchor_t = torch.tensor(row_anchor, dtype=torch.float32, device=device)
-    col_anchor_t = torch.tensor(col_anchor, dtype=torch.float32, device=device)
+    # col_anchor_t = torch.tensor(col_anchor, dtype=torch.float32, device=device)
 
     if isinstance(image_widths, torch.Tensor):
         img_w = image_widths.float().to(device).reshape(-1)
@@ -137,22 +137,23 @@ def pred2coords(pred, row_anchor, col_anchor, image_widths, image_heights, local
         img_h = img_h.view(B, 1, 1)
 
     max_idx_row = pred['loc_row'].argmax(dim=1)
-    max_idx_col = pred['loc_col'].argmax(dim=1)
+    # max_idx_col = pred['loc_col'].argmax(dim=1)
 
     valid_row = pred['exist_row'].argmax(1)
-    valid_col = pred['exist_col'].argmax(1)
+    # valid_col = pred['exist_col'].argmax(1)
 
     lane_label = None
     if 'lane_label' in pred and pred['lane_label'] is not None:
         lane_label = (pred['lane_label'].sigmoid() > 0.5)  # (B, 4, 8) bool tensor
 
-    row_lane_idx = [1, 2]
-    # 返回的 row_coords 是 GPU Tensor: (B, 2, H_row, 2)
+    row_lane_idx = [0, 1, 2, 3]
+    # 返回的 row_coords 是 GPU Tensor: (B, 4, H_row, 2)
     row_coords = process_row_lanes(pred['loc_row'], valid_row, max_idx_row, row_lane_idx, row_anchor_t, img_w, num_grid_row, H_row, local_width)
 
-    col_lane_idx = [0, 3]
-    # 返回的 col_coords 是 GPU Tensor: (B, 2, H_col, 2)
-    col_coords = process_col_lanes(pred['loc_col'], valid_col, max_idx_col, col_lane_idx, col_anchor_t, img_h, num_grid_col, H_col, local_width)
+    # col_lane_idx = [0, 3]
+    # # 返回的 col_coords 是 GPU Tensor: (B, 2, H_col, 2)
+    # col_coords = process_col_lanes(pred['loc_col'], valid_col, max_idx_col, col_lane_idx, col_anchor_t, img_h, num_grid_col, H_col, local_width)
+    col_coords = []
 
     return row_coords, col_coords, lane_label
 
@@ -166,7 +167,7 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
     # 2. 获取 GT (确保是 Tensor 且在同一个 device 上)
     device = row_coords.device
     gt_row_coords = gt["row_coords"] if isinstance(gt["row_coords"], torch.Tensor) else torch.tensor(gt["row_coords"], device=device)
-    gt_col_coords = gt["col_coords"] if isinstance(gt["col_coords"], torch.Tensor) else torch.tensor(gt["col_coords"], device=device)
+    # gt_col_coords = gt["col_coords"] if isinstance(gt["col_coords"], torch.Tensor) else torch.tensor(gt["col_coords"], device=device)
     gt_lane_label = gt["lane_label"] if isinstance(gt["lane_label"], torch.Tensor) else torch.tensor(gt["lane_label"], device=device)
 
     B = row_coords.shape[0]
@@ -187,8 +188,8 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
     ll_attr_tn = (~p_lab & ~g_lab).sum().float()
 
     # ================= 2. Row Coords 评估 (关注 x 坐标, 索引 0) =================
-    p_row_x = row_coords[..., 0]      # (B, 2, H_row)
-    g_row_x = gt_row_coords[..., 0]   # (B, 2, H_row)
+    p_row_x = row_coords[..., 0]      # (B, 4, H_row)
+    g_row_x = gt_row_coords[..., 0]   # (B, 4, H_row)
     
     p_inv_r = (p_row_x <= -2.0)
     g_inv_r = (g_row_x <= -2.0)
@@ -204,23 +205,23 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
     row_fp += both_valid_wrong_r.sum().float()
     row_fn += both_valid_wrong_r.sum().float()
 
-    # ================= 3. Col Coords 评估 (关注 y 坐标, 索引 1) =================
-    p_col_y = col_coords[..., 1]      # (B, 2, H_col)
-    g_col_y = gt_col_coords[..., 1]   # (B, 2, H_col)
+    # # ================= 3. Col Coords 评估 (关注 y 坐标, 索引 1) =================
+    # p_col_y = col_coords[..., 1]      # (B, 2, H_col)
+    # g_col_y = gt_col_coords[..., 1]   # (B, 2, H_col)
     
-    p_inv_c = (p_col_y <= -2.0)
-    g_inv_c = (g_col_y <= -2.0)
+    # p_inv_c = (p_col_y <= -2.0)
+    # g_inv_c = (g_col_y <= -2.0)
     
-    both_valid_c = (~p_inv_c) & (~g_inv_c)
-    diff_ok_c = torch.abs(p_col_y - g_col_y) <= math.ceil(train_height * 0.01)
+    # both_valid_c = (~p_inv_c) & (~g_inv_c)
+    # diff_ok_c = torch.abs(p_col_y - g_col_y) <= math.ceil(train_height * 0.01)
     
-    col_tp = (both_valid_c & diff_ok_c).sum().float()
-    col_fp = ((~p_inv_c) & g_inv_c).sum().float()
-    col_fn = (p_inv_c & (~g_inv_c)).sum().float()
+    # col_tp = (both_valid_c & diff_ok_c).sum().float()
+    # col_fp = ((~p_inv_c) & g_inv_c).sum().float()
+    # col_fn = (p_inv_c & (~g_inv_c)).sum().float()
     
-    both_valid_wrong_c = both_valid_c & (~diff_ok_c)
-    col_fp += both_valid_wrong_c.sum().float()
-    col_fn += both_valid_wrong_c.sum().float()
+    # both_valid_wrong_c = both_valid_c & (~diff_ok_c)
+    # col_fp += both_valid_wrong_c.sum().float()
+    # col_fn += both_valid_wrong_c.sum().float()
 
     # ================= 只返回原始计数 =================
     results = {
@@ -236,9 +237,9 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
         'row_fp': row_fp.item(),
         'row_fn': row_fn.item(),
 
-        'col_tp': col_tp.item(),
-        'col_fp': col_fp.item(),
-        'col_fn': col_fn.item(),
+        # 'col_tp': col_tp.item(),
+        # 'col_fp': col_fp.item(),
+        # 'col_fn': col_fn.item(),
     }
     return results
 
@@ -264,10 +265,11 @@ def lane_compute_metrics(c):
     row_pr, row_re, row_f1 = _calc_f1(c['row_tp'], c['row_fp'], c['row_fn'])
 
     # Col
-    col_pr, col_re, col_f1 = _calc_f1(c['col_tp'], c['col_fp'], c['col_fn'])
+    # col_pr, col_re, col_f1 = _calc_f1(c['col_tp'], c['col_fp'], c['col_fn'])
 
     # Total
-    lane_total_f1 = 0.2 * ll_attr_f1 + 0.4 * row_f1 + 0.4 * col_f1
+    lane_total_f1 = 0.3 * ll_attr_f1 + 0.7 * row_f1
+    # lane_total_f1 = 0.2 * ll_attr_f1 + 0.4 * row_f1 + 0.4 * col_f1
 
     return {
         'll_lane_acc':       ll_lane_acc,
@@ -278,8 +280,8 @@ def lane_compute_metrics(c):
         'row_precision':     row_pr,
         'row_recall':        row_re,
         'row_f1':            row_f1,
-        'col_precision':     col_pr,
-        'col_recall':        col_re,
-        'col_f1':            col_f1,
+        # 'col_precision':     col_pr,
+        # 'col_recall':        col_re,
+        # 'col_f1':            col_f1,
         'lane_total_f1':     lane_total_f1,
     }

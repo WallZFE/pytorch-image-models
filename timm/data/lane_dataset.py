@@ -151,7 +151,7 @@ class LaneDataset(data.Dataset):
             self.debug_count += 1
             save_dir = "output/debug_vis"
             os.makedirs(save_dir, exist_ok=True)
-            save_path_raw = os.path.join(save_dir, f"raw_{index}.jpg")
+            save_path_raw = os.path.join(save_dir, f"{os.path.splitext(img_name)[0].replace('/', '-')}_{index}.jpg")
             save_path_aug = os.path.join(save_dir, f"aug_{index}.jpg")
             self.draw_lanes(cv2.cvtColor(img_raw, cv2.COLOR_RGB2BGR), points_raw.copy(), lane_label_raw.copy(), save_path_raw)
             self.draw_lanes(cv2.cvtColor(img_aug, cv2.COLOR_RGB2BGR), points.copy(), lane_label.copy(), save_path_aug)
@@ -174,8 +174,8 @@ class LaneDataset(data.Dataset):
             # points_row_extend shape: (H_row, num_lanes)
             points_row_extend = self._extend(points_row[:, :, 0]).transpose(0, 1) 
         else:
-            # Row Coords (2, H_row, 2)
-            row_coords = torch.from_numpy(points_row[[1, 2], :, :]).float()
+            # Row Coords (num_lanes, H_row, 2)
+            row_coords = torch.from_numpy(points_row).float()
             invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] > img_w)
             row_coords[..., 0] = torch.where(invalid_x, torch.full_like(row_coords[..., 0], -10000.0), row_coords[..., 0])
             target["row_coords"] = row_coords
@@ -187,9 +187,9 @@ class LaneDataset(data.Dataset):
         labels_row[(points_row_extend < 0) | (points_row_extend > img_w)] = -1
         labels_row[(labels_row < 0) | (labels_row > (self.num_cell_row - 1))] = -1
 
-        # labels_row 对应车道线 1, 2
-        # labels_row shape: (H_row, num_lanes) → 取第 1, 2 列
-        for lane_idx in [1, 2]:
+        # labels_row 对应车道线 0, 1, 2, 3
+        # labels_row shape: (H_row, num_lanes) → 取第 0, 1, 2, 3 列
+        for lane_idx in [0, 1, 2, 3]:
             if torch.all(labels_row[:, lane_idx] < 0):
                 lane_label[lane_idx] = 0.0   # 整个 (X, 8) 子维度全部置零
 
@@ -198,8 +198,8 @@ class LaneDataset(data.Dataset):
         # points_col shape: (num_lanes, H_col, 2)
         points_col = self._my_interp_cpu(points, self.interp_loc_col, direction=1)
         if self.split != 'train':
-            # Col Coords (2, H_col, 2)
-            col_coords = torch.from_numpy(points_col[[0, 3], :, :]).float()
+            # Col Coords (num_lanes, H_col, 2)
+            col_coords = torch.from_numpy(points_col).float()
             invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] > img_h)
             col_coords[..., 1] = torch.where(invalid_y, torch.full_like(col_coords[..., 1], -10000.0), col_coords[..., 1])
             target["col_coords"] = col_coords
@@ -211,11 +211,12 @@ class LaneDataset(data.Dataset):
         labels_col[(points_col_y < 0) | (points_col_y > img_h)] = -1
         labels_col[(labels_col < 0) | (labels_col > (self.num_cell_col - 1))] = -1
 
-        # labels_col 对应车道线 0, 3
-        # labels_col shape: (H_col, num_lanes) → 取第 0, 3 列
-        for lane_idx in [0, 3]:
-            if torch.all(labels_col[:, lane_idx] < 0):
-                lane_label[lane_idx] = 0.0
+        ## 全用row，不使用col
+        # # labels_col 对应车道线 0, 3
+        # # labels_col shape: (H_col, num_lanes) → 取第 0, 3 列
+        # for lane_idx in [0, 3]:
+        #    if torch.all(labels_col[:, lane_idx] < 0):
+        #         lane_label[lane_idx] = 0.0
 
         labels_row_float = points_row_extend / img_w * (self.num_cell_row - 1)
         labels_row_float[(labels_row_float < 0) | (labels_row_float > (self.num_cell_row - 1))] = -1

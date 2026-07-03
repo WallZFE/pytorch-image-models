@@ -145,7 +145,7 @@ def main():
             input_size=input_size,
             batch_size=args.batch_size,
             input_names = ["images"],
-            output_names = ["loc_row", "loc_col", "exist_row", "exist_col", "lane_label"],
+            output_names = ["loc_row", "exist_row", "lane_label"],
         )
     else:
         onnx_export(

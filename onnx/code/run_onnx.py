@@ -11,15 +11,19 @@ from natsort import natsorted
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
-ROW_COORDS = [73,  79,  86,  93, 100, 107, 114, 121, 128, 135,
-            142, 149, 156, 163, 170, 177, 184, 191, 198, 205,
-            212, 219, 226, 233, 240, 247, 254, 261, 268, 275,
-            282, 289, 296, 303, 310, 317, 324, 331, 338, 345,
-            352, 359]
-COL_COORDS = [2, 20, 40, 60, 80, 100, 120, 140, 160, 180,
-            200, 220, 240, 260, 280, 300, 320, 340, 360, 380,
-            400, 420, 440, 460, 480, 500, 520, 540, 560, 580,
-            600, 620, 638]
+ROW_COORDS = [115, 118, 120, 123, 125, 128, 130, 133, 136, 139,
+              141, 144, 147, 150, 153, 156, 160, 163, 166, 170,
+              173, 177, 181, 184, 188, 192, 197, 201, 205, 209,
+              214, 218, 223, 228, 233, 238, 243, 248, 253, 258,
+              263, 269, 274, 280, 285, 291, 297, 302, 308, 314,
+              320, 326, 333, 339, 345, 350, 355, 359]
+COL_COORDS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 
+              100, 110, 120, 130, 140, 150, 160, 170, 180, 190,
+              200, 210, 220, 230, 240, 250, 260, 270, 280, 290,
+              300, 310, 320, 330, 340, 350, 360, 370, 380, 390,
+              400, 410, 420, 430, 440, 450, 460, 470, 480, 490,
+              500, 510, 520, 530, 540, 550, 560, 570, 580, 590,
+              600, 610, 620, 630, 639]
 
 MEAN = [0.5, 0.5, 0.5]
 STD = [0.5, 0.5, 0.5]
@@ -324,9 +328,9 @@ def bce_with_logits_loss_np(logits, targets):
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='ONNX车道线检测推理')
-    parser.add_argument('--mode', type=str, default='video', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
+    parser.add_argument('--mode', type=str, default='json', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
     parser.add_argument('--onnx_model', type=str, default="../model/output_model.onnx", help='ONNX模型文件路径')
-    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose/images", help='图片目录路径')
+    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose", help='图片目录路径')
     parser.add_argument('--test_txt', type=str, default="../../../data/model_use/TUSimple/test.txt", help='eval模式下使用的 test.txt 图片列表文件路径')
     parser.add_argument('--cache_path', type=str, default="../../../data/model_use/TUSimple/tusimple_anno_cache_test.json", help='测试集GT标注缓存JSON路径 (eval模式需要)')
     parser.add_argument('--train_height', type=int, default=288, help='模型输入高度')
@@ -381,7 +385,7 @@ def onnx_inference(session, input_name, output_names, input_data):
     # 通常顺序: loc_row, loc_col, exist_row, exist_col, lane_label
     # 如果你的模型输出顺序不同，请在这里修改
     pred = {}
-    if len(output_names) == 5:
+    if len(output_names) == 3:
         for name, val in zip(output_names, outputs):
             pred[name] = val
     else:
@@ -417,18 +421,12 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
     :return: all_coords, all_lane_labels
     """
     loc_row = find_output_key(pred, 'loc_row')
-    loc_col = find_output_key(pred, 'loc_col')
     exist_row = find_output_key(pred, 'exist_row')
-    exist_col = find_output_key(pred, 'exist_col')
 
     batch_size, num_grid_row, num_cls_row, num_lane_row = loc_row.shape
-    batch_size2, num_grid_col, num_cls_col, num_lane_col = loc_col.shape
 
     max_indices_row = np.argmax(loc_row, axis=1)  # (B, num_cls_row, num_lane_row)
     valid_row = np.argmax(exist_row, axis=1)       # (B, num_cls_row, num_lane_row)
-
-    max_indices_col = np.argmax(loc_col, axis=1)
-    valid_col = np.argmax(exist_col, axis=1)
 
     # 获取车道线属性标签
     try:
@@ -442,8 +440,7 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
     all_coords = [[] for _ in range(batch_size)]
     all_lane_labels = [{} for _ in range(batch_size)]
 
-    row_lane_idx = [1, 2]
-    col_lane_idx = [0, 3]
+    row_lane_idx = [0, 1, 2, 3]
 
     for b in range(batch_size):
         img_w = original_image_widths[b]
@@ -479,33 +476,6 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
                             lane_labels[str(i)] = []
                         lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
 
-        # ---- 处理列方向车道线 ----
-        for i in col_lane_idx:
-            tmp = []
-            if valid_col[b, :, i].sum() > 0:
-                for k in range(valid_col.shape[1]):
-                    if valid_col[b, k, i]:
-                        idx_center = int(max_indices_col[b, k, i])
-                        all_ind = list(range(max(0, idx_center - local_width),
-                                             min(num_grid_col - 1, idx_center + local_width) + 1))
-                        all_ind = np.array(all_ind, dtype=np.int64)
-
-                        raw_vals = loc_col[b, all_ind, k, i]
-                        probs = softmax_np(raw_vals)
-                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) #+ 0.5
-                        out_tmp = out_tmp / (num_grid_col - 1) * img_h
-                        x_val = int(COL_COORDS[k] / 640.0 * img_w)
-                        tmp.append((x_val, int(out_tmp)))
-
-            coords.append(tmp)
-
-            if lane_label is not None:
-                for tmp_n in range(len(lane_label_index_dic)):
-                    if lane_label[b, i, tmp_n]:
-                        if str(i) not in lane_labels:
-                            lane_labels[str(i)] = []
-                        lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
-
         all_coords[b] = coords
         all_lane_labels[b] = lane_labels
 
@@ -513,6 +483,47 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
 
 
 # ==================== JSON 模式 ====================
+
+def douglas_peucker(points, epsilon):
+    """
+    Douglas-Peucker 折线简化算法
+    points: [(x, y), ...] 有序点列
+    epsilon: 容差，越大点越少
+    """
+    if len(points) <= 2:
+        return points
+
+    # 找到离首尾连线最远的点
+    start, end = points[0], points[-1]
+    max_dist = 0
+    max_idx = 0
+
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    line_len_sq = dx * dx + dy * dy
+
+    for i in range(1, len(points) - 1):
+        px, py = points[i]
+        if line_len_sq == 0:
+            dist = ((px - start[0])**2 + (py - start[1])**2) ** 0.5
+        else:
+            t = max(0, min(1, ((px - start[0]) * dx + (py - start[1]) * dy) / line_len_sq))
+            proj_x = start[0] + t * dx
+            proj_y = start[1] + t * dy
+            dist = ((px - proj_x)**2 + (py - proj_y)**2) ** 0.5
+
+        if dist > max_dist:
+            max_dist = dist
+            max_idx = i
+
+    # 如果最大距离超过容差，递归简化
+    if max_dist > epsilon:
+        left = douglas_peucker(points[:max_idx + 1], epsilon)
+        right = douglas_peucker(points[max_idx:], epsilon)
+        return left[:-1] + right
+    else:
+        return [start, end]
+
 
 def process_single_image_json(img_path, coords, lane_labels, img_h, img_w, need_base64=True):
     """处理单个图像并生成 labelme 风格 JSON"""
@@ -531,7 +542,7 @@ def process_single_image_json(img_path, coords, lane_labels, img_h, img_w, need_
         _, buffer = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
         json_data["imageData"] = base64.b64encode(buffer).decode('utf-8')
 
-    for num, index in enumerate([1, 2, 0, 3]):
+    for num, index in enumerate([0, 1, 2, 3]):
         lane = coords[num]
         if len(lane) == 0:
             continue
@@ -540,21 +551,7 @@ def process_single_image_json(img_path, coords, lane_labels, img_h, img_w, need_
         lane_sorted = sorted(lane_list, key=lambda pt: pt[1])
 
         if len(lane_sorted) > 2:
-            min_pt = lane_sorted[0]
-            max_pt = lane_sorted[-1]
-
-            zone1 = [pt for pt in lane_sorted if pt[1] < img_h * 0.3]
-            zone2 = [pt for pt in lane_sorted if img_h * 0.3 <= pt[1] <= img_h * 0.6]
-            zone3 = [pt for pt in lane_sorted if pt[1] > img_h * 0.6]
-
-            filtered_lane = zone1 + zone2[::2] + zone3[::4]
-
-            if min_pt not in filtered_lane:
-                filtered_lane.insert(0, min_pt)
-            if max_pt not in filtered_lane:
-                filtered_lane.append(max_pt)
-
-            final_points = filtered_lane
+            final_points = douglas_peucker(lane_sorted, epsilon=3.5)
         else:
             final_points = lane_sorted
 
@@ -779,7 +776,7 @@ def my_interp_cpu(points, interp_loc, direction=0):
 
     return output
 
-def load_gt_labels(image_list, data_root, cache_path, num_cell_row=100, num_cell_col=100, row_lane_idx=[1,2], col_lane_idx=[0,3]):
+def load_gt_labels(image_list, data_root, cache_path, num_cell_row=100, row_lane_idx=[0, 1, 2, 3]):
     """
     从GT缓存文件加载ground truth标签
 
@@ -813,11 +810,8 @@ def load_gt_labels(image_list, data_root, cache_path, num_cell_row=100, num_cell
 
         target = {
             "labels_row": None,
-            "labels_col": None,
             "labels_row_float": None,
-            "labels_col_float": None,
             "row_coords": None,
-            "col_coords": None,
             "lane_label": lane_label,
             "img_w": img_w,
             "img_h": img_h,
@@ -835,31 +829,13 @@ def load_gt_labels(image_list, data_root, cache_path, num_cell_row=100, num_cell
         labels_row[(points_row_extend < 0) | (points_row_extend > img_w)] = -1
         labels_row[(labels_row < 0) | (labels_row > (num_cell_row - 1))] = -1
 
-
-        # col 列
-        points_col = my_interp_cpu(points, COL_COORDS, direction=1)
-        # points_col_y shape: (H_col, num_lanes) —— 取 y 坐标并转置
-        points_col_y = points_col[:, :, 1].T
-
-        # labels_col: 离散化为整数标签
-        labels_col = (points_col_y / img_h * (num_cell_col - 1)).astype(np.int64)
-        labels_col[(points_col_y < 0) | (points_col_y > img_h)] = -1
-        labels_col[(labels_col < 0) | (labels_col > (num_cell_col - 1))] = -1
-
-
         # labels_row_float: 归一化浮点标签
         labels_row_float = points_row_extend / img_w
         labels_row_float[(labels_row_float < 0) | (labels_row_float > 1)] = -1
 
-        # labels_col_float: 归一化浮点标签
-        labels_col_float = points_col_y / img_h
-        labels_col_float[(labels_col_float < 0) | (labels_col_float > 1)] = -1
-
         # 填充 target
         target["labels_row"] = labels_row
-        target["labels_col"] = labels_col
         target["labels_row_float"] = labels_row_float
-        target["labels_col_float"] = labels_col_float
 
         # Row Coords (选取指定 lane_idx，默认 [1, 2])
         pts_row = points[row_lane_idx, :, :]   # (len(row_lane_idx), num_points, 2)
@@ -869,16 +845,7 @@ def load_gt_labels(image_list, data_root, cache_path, num_cell_row=100, num_cell
         invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] > img_w)
         row_coords[..., 0] = np.where(invalid_x, -10000.0, row_coords[..., 0])
 
-        # Col Coords (选取指定 lane_idx，默认 [0, 3])
-        pts_col = points[col_lane_idx, :, :]   # (len(col_lane_idx), num_points, 2)
-        interp_col = my_interp_cpu(pts_col, COL_COORDS, direction=1)  # (len(col_lane_idx), H_col, 2)
-        col_coords = interp_col.astype(np.float32)
-
-        invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] > img_h)
-        col_coords[..., 1] = np.where(invalid_y, -10000.0, col_coords[..., 1])
-
         target["row_coords"] = row_coords
-        target["col_coords"] = col_coords
 
         labels_dict[img_path] = target
 
@@ -892,14 +859,11 @@ def compute_test_loss(pred, target):
 
     :param pred: dict, ONNX模型输出字典
         - 'loc_row':     (B, C_row, H_row, num_lane_row)
-        - 'loc_col':     (B, C_col, H_col, num_lane_col)
         - 'exist_row':   (B, 2, H_row, num_lane_row)
-        - 'exist_col':   (B, 2, H_col, num_lane_col)
         - 'lane_label':  (B, num_lanes, num_attrs)   ← 原始logits
 
     :param target: dict, ground truth标签字典
         - 'labels_row':    (B, H_row, num_lane_row)  int64, 值域 [-1, C_row-1]
-        - 'labels_col':    (B, H_col, num_lane_col)  int64, 值域 [-1, C_col-1]
         - 'lane_label':    (B, num_lanes, num_attrs) float32, 0/1标签
 
     :return: (total_loss, loss_items_dict)
@@ -908,16 +872,12 @@ def compute_test_loss(pred, target):
     cls_loss_weight = 1.0
     relation_loss_weight = 0.0
     relation_dis_weight = 0.0
-    cls_loss_col_weight = 1.0
     cls_ext_weight = 1.0
-    cls_ext_col_weight = 1.0
-    mean_loss_row_weight = 0.05
-    mean_loss_col_weight = 0.05
+    mean_loss_row_weight = 1.0
     lane_attr_loss_weight = 1.0
 
     # exist labels: 0/1 整数
     cls_out_ext_label = (target['labels_row'] != -1).astype(np.int64)    # (1, H_row, num_lanes)
-    cls_out_col_ext_label = (target['labels_col'] != -1).astype(np.int64)  # (1, H_col, num_lanes)
 
     total_loss = 0.0
     loss_items = {}
@@ -940,37 +900,19 @@ def compute_test_loss(pred, target):
         loss_items['relation_dis'] = loss_cur
         total_loss += loss_cur * relation_dis_weight
 
-    # 4. cls_loss_col
-    if cls_loss_col_weight != 0:
-        loss_cur = softmax_focal_loss_np(pred['loc_col'], target['labels_col'])
-        loss_items['cls_loss_col'] = loss_cur
-        total_loss += loss_cur * cls_loss_col_weight
-
-    # 5. cls_ext (exist_row)
+    # 4. cls_ext (exist_row)
     if cls_ext_weight != 0:
         loss_cur = cross_entropy_np(pred['exist_row'], cls_out_ext_label)
         loss_items['cls_ext'] = loss_cur
         total_loss += loss_cur * cls_ext_weight
 
-    # 6. cls_ext_col (exist_col)
-    if cls_ext_col_weight != 0:
-        loss_cur = cross_entropy_np(pred['exist_col'], cls_out_col_ext_label)
-        loss_items['cls_ext_col'] = loss_cur
-        total_loss += loss_cur * cls_ext_col_weight
-
-    # 7. mean_loss_row
+    # 5. mean_loss_row
     if mean_loss_row_weight != 0:
         loss_cur = mean_loss_np(pred['loc_row'], target['labels_row'])
         loss_items['mean_loss_row'] = loss_cur
         total_loss += loss_cur * mean_loss_row_weight
 
-    # 8. mean_loss_col
-    if mean_loss_col_weight != 0:
-        loss_cur = mean_loss_np(pred['loc_col'], target['labels_col'])
-        loss_items['mean_loss_col'] = loss_cur
-        total_loss += loss_cur * mean_loss_col_weight
-
-    # 9. lane_attr_loss (BCE)
+    # 6. lane_attr_loss (BCE)
     if lane_attr_loss_weight != 0:
         loss_cur = bce_with_logits_loss_np(pred['lane_label'], target['lane_label'])
         loss_items['lane_attr_loss'] = loss_cur
@@ -1026,62 +968,12 @@ def process_row_lanes(loc_row, valid_row, max_idx_row, lane_indices, row_anchor_
 
     return coords
 
-def process_col_lanes(loc_col, valid_col, max_idx_col, lane_indices, col_anchor_t, img_h, num_grid_col, H_col, local_width):
-    B = loc_col.shape[0]
-    num_lanes = len(lane_indices)
-    lane_idx_arr = np.array(lane_indices, dtype=np.int64)
-
-    v = valid_col[:, :, lane_idx_arr]
-    m = max_idx_col[:, :, lane_idx_arr]
-
-    if v.shape[1] >= H_col:
-        v = v[:, :H_col, :]
-        m = m[:, :H_col, :]
-    else:
-        pad_h = H_col - v.shape[1]
-        v = np.pad(v, ((0, 0), (0, pad_h), (0, 0)), constant_values=False)
-        m = np.pad(m, ((0, 0), (0, pad_h), (0, 0)), constant_values=0)
-
-    v = v.astype(bool)
-    m = m.astype(np.int64)
-
-    offsets = np.arange(-local_width, local_width + 1)
-    all_ind = m[..., np.newaxis] + offsets.reshape(1, 1, 1, -1)
-    all_ind = np.clip(all_ind, 0, num_grid_col - 1)
-
-    b_idx = np.arange(B).reshape(B, 1, 1, 1)
-    h_idx = np.arange(H_col).reshape(1, H_col, 1, 1)
-    l_idx = lane_idx_arr.reshape(1, 1, num_lanes, 1)
-
-    b_e = np.broadcast_to(b_idx, (B, H_col, num_lanes, all_ind.shape[-1]))
-    h_e = np.broadcast_to(h_idx, (B, H_col, num_lanes, all_ind.shape[-1]))
-    l_e = np.broadcast_to(l_idx, (B, H_col, num_lanes, all_ind.shape[-1]))
-
-    logits = loc_col[b_e, all_ind, h_e, l_e]
-    weights = softmax_np_axis(logits, axis=-1)
-    refined = np.sum(weights * all_ind.astype(np.float32), axis=-1) + 0.5
-
-    y = refined / (num_grid_col - 1) * img_h
-    y = y.transpose(0, 2, 1)
-    x = np.broadcast_to(col_anchor_t.reshape(1, 1, H_col), (B, num_lanes, H_col))
-
-    coords = np.stack([x, y], axis=-1)
-
-    invalid = ~v.transpose(0, 2, 1)
-    coords[..., 0] = np.where(invalid, x.astype(np.float32), coords[..., 0])
-    coords[..., 1] = np.where(invalid, np.full_like(coords[..., 1], -10000.0), coords[..., 1])
-
-    return coords
-
 def pred2coords_row_col(pred, row_anchor, col_anchor, image_widths, image_heights, local_width=1):
     B = pred['loc_row'].shape[0]
     num_grid_row = pred['loc_row'].shape[1]
-    num_grid_col = pred['loc_col'].shape[1]
     H_row = len(row_anchor)
-    H_col = len(col_anchor)
 
     row_anchor_t = np.array(row_anchor, dtype=np.float32)
-    col_anchor_t = np.array(col_anchor, dtype=np.float32)
 
     if isinstance(image_widths, np.ndarray):
         img_w = image_widths.astype(np.float32).reshape(-1)
@@ -1111,21 +1003,18 @@ def pred2coords_row_col(pred, row_anchor, col_anchor, image_widths, image_height
         img_h = img_h.reshape(B, 1, 1)
 
     max_idx_row = np.argmax(pred['loc_row'], axis=1)
-    max_idx_col = np.argmax(pred['loc_col'], axis=1)
 
     valid_row = np.argmax(pred['exist_row'], axis=1)
-    valid_col = np.argmax(pred['exist_col'], axis=1)
 
     lane_label = None
     if 'lane_label' in pred and pred['lane_label'] is not None:
         lane_label = sigmoid_np(pred['lane_label']) > 0.5
 
-    row_lane_idx = [1, 2]
+    row_lane_idx = [0, 1, 2, 3]
     row_coords = process_row_lanes(pred['loc_row'], valid_row, max_idx_row, row_lane_idx, row_anchor_t, img_w, num_grid_row, H_row, local_width)
-
-    col_lane_idx = [0, 3]
-    col_coords = process_col_lanes(pred['loc_col'], valid_col, max_idx_col, col_lane_idx, col_anchor_t, img_h, num_grid_col, H_col, local_width)
-
+    
+    col_coords = []
+    
     return row_coords, col_coords, lane_label
 
 
@@ -1149,11 +1038,8 @@ def lane_compute_metrics(c):
     # Row
     row_pr, row_re, row_f1 = _calc_f1(c['row_tp'], c['row_fp'], c['row_fn'])
 
-    # Col
-    col_pr, col_re, col_f1 = _calc_f1(c['col_tp'], c['col_fp'], c['col_fn'])
-
     # Total
-    lane_total_f1 = 0.2 * ll_attr_f1 + 0.4 * row_f1 + 0.4 * col_f1
+    lane_total_f1 = 0.3 * ll_attr_f1 + 0.7 * row_f1
 
     return {
         'll_lane_acc':       ll_lane_acc,
@@ -1164,9 +1050,6 @@ def lane_compute_metrics(c):
         'row_precision':     row_pr,
         'row_recall':        row_re,
         'row_f1':            row_f1,
-        'col_precision':     col_pr,
-        'col_recall':        col_re,
-        'col_f1':            col_f1,
         'lane_total_f1':     lane_total_f1,
     }
 
@@ -1179,7 +1062,6 @@ def lane_test(pred, gt, train_width, train_height):
         
     # 2. 获取 GT (确保是 numpy array)
     gt_row_coords = gt["row_coords"] if isinstance(gt["row_coords"], np.ndarray) else np.array(gt["row_coords"])
-    gt_col_coords = gt["col_coords"] if isinstance(gt["col_coords"], np.ndarray) else np.array(gt["col_coords"])
     gt_lane_label = gt["lane_label"] if isinstance(gt["lane_label"], np.ndarray) else np.array(gt["lane_label"])
 
     B = row_coords.shape[0]
@@ -1217,24 +1099,6 @@ def lane_test(pred, gt, train_width, train_height):
     row_fp += float(np.sum(both_valid_wrong_r))
     row_fn += float(np.sum(both_valid_wrong_r))
 
-    # ================= 3. Col Coords 评估 =================
-    p_col_y = col_coords[..., 1]
-    g_col_y = gt_col_coords[..., 1]
-    
-    p_inv_c = (p_col_y <= -2.0)
-    g_inv_c = (g_col_y <= -2.0)
-    
-    both_valid_c = (~p_inv_c) & (~g_inv_c)
-    diff_ok_c = np.abs(p_col_y - g_col_y) <= math.ceil(train_height * 0.01)
-    
-    col_tp = float(np.sum(both_valid_c & diff_ok_c))
-    col_fp = float(np.sum((~p_inv_c) & g_inv_c))
-    col_fn = float(np.sum(p_inv_c & (~g_inv_c)))
-    
-    both_valid_wrong_c = both_valid_c & (~diff_ok_c)
-    col_fp += float(np.sum(both_valid_wrong_c))
-    col_fn += float(np.sum(both_valid_wrong_c))
-
     # ================= 只返回原始计数 =================
     results = {
         'll_lane_correct': ll_lane_correct,
@@ -1248,10 +1112,6 @@ def lane_test(pred, gt, train_width, train_height):
         'row_tp': row_tp,
         'row_fp': row_fp,
         'row_fn': row_fn,
-
-        'col_tp': col_tp,
-        'col_fp': col_fp,
-        'col_fn': col_fn,
     }
     return results
 
@@ -1265,15 +1125,13 @@ def run_eval_mode(session, input_name, output_names, image_list, args):
     dummy_input = np.zeros((1, 3, args.train_height, args.train_width), dtype=np.float32)
     dummy_pred = onnx_inference(session, input_name, output_names, dummy_input)
     loc_row_shape = find_output_key(dummy_pred, 'loc_row').shape
-    loc_col_shape = find_output_key(dummy_pred, 'loc_col').shape
     
     num_cell_row = loc_row_shape[1]  
-    num_cell_col = loc_col_shape[1]  
-    print(f"检测到模型 Grid 数量 -> Row: {num_cell_row}, Col: {num_cell_col}")
+    print(f"检测到模型 Grid 数量 -> Row: {num_cell_row}")
 
     # 加载 GT 标签
     print("正在加载 Ground Truth 标签并进行插值...")
-    gt_labels = load_gt_labels(image_list, args.demo_data_root, args.cache_path, num_cell_row, num_cell_col)
+    gt_labels = load_gt_labels(image_list, args.demo_data_root, args.cache_path, num_cell_row)
     
     valid_image_list = [p for p in image_list if p in gt_labels]
     if len(valid_image_list) == 0:
@@ -1289,8 +1147,7 @@ def run_eval_mode(session, input_name, output_names, image_list, args):
     # 1. 初始化 Loss 累加器
     all_losses = {
         'total_loss': 0.0, 'cls_loss': 0.0, 'relation_loss': 0.0, 'relation_dis': 0.0, 
-        'cls_loss_col': 0.0, 'cls_ext': 0.0, "cls_ext_col": 0.0, 
-        'mean_loss_row': 0.0, 'mean_loss_col': 0.0, 'lane_attr_loss': 0.0
+        'cls_ext': 0.0,  'mean_loss_row': 0.0, 'lane_attr_loss': 0.0
     }
     
     # 2. 初始化 Lane 指标累加器 (对应 lane_test 返回的 keys)
@@ -1298,7 +1155,6 @@ def run_eval_mode(session, input_name, output_names, image_list, args):
         'll_lane_correct': 0.0, 'll_lane_total': 0.0,
         'll_attr_tp': 0.0, 'll_attr_fp': 0.0, 'll_attr_fn': 0.0, 'll_attr_tn': 0.0,
         'row_tp': 0.0, 'row_fp': 0.0, 'row_fn': 0.0,
-        'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
     }
     
     valid_count = 0
@@ -1327,10 +1183,8 @@ def run_eval_mode(session, input_name, output_names, image_list, args):
         # 组装 Target (使用过滤后的 batch_paths)
         target = {
             'labels_row': np.stack([gt_labels[p]['labels_row'] for p in batch_paths], axis=0),
-            'labels_col': np.stack([gt_labels[p]['labels_col'] for p in batch_paths], axis=0),
             'lane_label': np.stack([gt_labels[p]['lane_label'] for p in batch_paths], axis=0),
             'row_coords': np.stack([gt_labels[p]['row_coords'] for p in batch_paths], axis=0),
-            'col_coords': np.stack([gt_labels[p]['col_coords'] for p in batch_paths], axis=0),
         }
 
         # 计算 Loss
