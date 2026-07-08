@@ -17,13 +17,6 @@ ROW_COORDS = [115, 118, 120, 123, 125, 128, 130, 133, 136, 139,
               214, 218, 223, 228, 233, 238, 243, 248, 253, 258,
               263, 269, 274, 280, 285, 291, 297, 302, 308, 314,
               320, 326, 333, 339, 345, 350, 355, 359]
-COL_COORDS = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 
-              100, 110, 120, 130, 140, 150, 160, 170, 180, 190,
-              200, 210, 220, 230, 240, 250, 260, 270, 280, 290,
-              300, 310, 320, 330, 340, 350, 360, 370, 380, 390,
-              400, 410, 420, 430, 440, 450, 460, 470, 480, 490,
-              500, 510, 520, 530, 540, 550, 560, 570, 580, 590,
-              600, 610, 620, 630, 639]
 
 MEAN = [0.5, 0.5, 0.5]
 STD = [0.5, 0.5, 0.5]
@@ -413,11 +406,13 @@ def find_output_key(pred, target_key):
 
 # ==================== 核心推理后处理 ====================
 
-def pred2coords(pred, local_width=5, original_image_widths=None, original_image_heights=None, predict_next_num=1, straight_error=2.0):
+def pred2coords(pred, local_width=5, original_image_widths=None, original_image_heights=None, train_width=None, train_height=None, resize_mode='original'):
     """
     预测结果转坐标
     :param pred: ONNX输出的字典
     :param original_image_widths/heights: 每个样本的原始图片尺寸（列表）
+    :param train_width/train_height: 模型输入尺寸
+    :param resize_mode: 对坐标映射到原始图片尺寸或模型输入尺寸，默认原始图片尺寸
     :return: all_coords, all_lane_labels
     """
     loc_row = find_output_key(pred, 'loc_row')
@@ -429,12 +424,9 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
     valid_row = np.argmax(exist_row, axis=1)       # (B, num_cls_row, num_lane_row)
 
     # 获取车道线属性标签
-    try:
-        lane_label_raw = find_output_key(pred, 'lane_label')
-        lane_label_prob = sigmoid_np(lane_label_raw)  # (B, 4, 8)
-        lane_label = (lane_label_prob > 0.5).astype(np.uint8)
-    except Exception:
-        lane_label = None
+    lane_label_raw = find_output_key(pred, 'lane_label')
+    lane_label_prob = sigmoid_np(lane_label_raw)  # (B, 4, 8)
+    lane_label = (lane_label_prob > 0.5).astype(np.uint8)
 
     # 预分配结果
     all_coords = [[] for _ in range(batch_size)]
@@ -449,7 +441,6 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
         coords = []
         lane_labels = {}
 
-        # ---- 处理行方向车道线 ----
         for i in row_lane_idx:
             tmp = []
             if valid_row[b, :, i].sum() > 0:
@@ -462,19 +453,22 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
 
                         raw_vals = loc_row[b, all_ind, k, i]  # (local_width*2+1,)
                         probs = softmax_np(raw_vals)
-                        out_tmp = np.sum(probs * all_ind.astype(np.float32)) #+ 0.5
-                        out_tmp = out_tmp / (num_grid_row - 1) * img_w
-                        y_val = int(ROW_COORDS[k] / 360.0 * img_h)
+                        out_tmp = np.sum(probs * all_ind.astype(np.float32))
+                        if resize_mode == "original":
+                            out_tmp = out_tmp / (num_grid_row - 1) * img_w
+                            y_val = int(ROW_COORDS[k] / 360.0 * img_h)
+                        else:
+                            out_tmp = out_tmp / (num_grid_row - 1) * train_width
+                            y_val = int(ROW_COORDS[k])
                         tmp.append((int(out_tmp), y_val))
 
             coords.append(tmp)
 
-            if lane_label is not None:
-                for tmp_n in range(len(lane_label_index_dic)):
-                    if lane_label[b, i, tmp_n]:
-                        if str(i) not in lane_labels:
-                            lane_labels[str(i)] = []
-                        lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
+            for tmp_n in range(len(lane_label_index_dic)):
+                if lane_label[b, i, tmp_n]:
+                    if str(i) not in lane_labels:
+                        lane_labels[str(i)] = []
+                    lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
 
         all_coords[b] = coords
         all_lane_labels[b] = lane_labels
@@ -605,7 +599,7 @@ def run_json_mode(session, input_name, output_names, image_list, args):
         pred = onnx_inference(session, input_name, output_names, input_data)
 
         # 后处理
-        all_coords, all_lane_labels = pred2coords(pred, original_image_widths=original_widths,original_image_heights=original_heights, predict_next_num=2, straight_error=3)
+        all_coords, all_lane_labels = pred2coords(pred, original_image_widths=original_widths,original_image_heights=original_heights)
 
         # 保存JSON
         for b in range(len(valid_paths)):
@@ -631,17 +625,31 @@ def run_json_mode(session, input_name, output_names, image_list, args):
 
 # ==================== 视频模式 ====================
 
-def draw_lane_on_image(vis, coords, lane_labels):
-    """在图像上绘制车道线和标签"""
-    # 绘制车道线点和连线
-    for lane in coords:
+def draw_lane_on_image(vis, coords, filter_coords, lane_labels):
+    """
+    在图像上绘制车道线和标签
+    """
+
+    for num, lane in enumerate(coords):
+        if len(lane) == 0:
+            continue
+        for coord in lane:
+            if num == 0:
+                cv2.circle(vis, (int(coord[0]), int(coord[1])), 8, (255, 0, 0), -1)
+            elif num == 1:
+                cv2.circle(vis, (int(coord[0]), int(coord[1])), 8, (0, 140, 255), -1)
+            elif num == 2:
+                cv2.circle(vis, (int(coord[0]), int(coord[1])), 8, (0, 255, 255), -1)
+            else:
+                cv2.circle(vis, (int(coord[0]), int(coord[1])), 8, (0, 255, 128), -1)
+    
+    for lane in filter_coords:
         if len(lane) == 0:
             continue
         for num, coord in enumerate(lane):
-            cv2.circle(vis, coord, 10, (0, 255, 255), -1)
             if num == 0:
                 continue
-            cv2.line(vis, lane[num - 1], lane[num], (0, 255, 0), 9)
+            cv2.line(vis, (int(lane[num - 1][0]), int(lane[num - 1][1])) , (int(lane[num][0]), int(lane[num][1])),  (0, 255, 0), 7)
 
     # 绘制标签文字（使用PIL支持中文）
     sorted_keys = sorted(lane_labels.keys(), key=lambda x: int(x))
@@ -667,6 +675,30 @@ def draw_lane_on_image(vis, coords, lane_labels):
         vis = cv2.cvtColor(np.array(vis_pil), cv2.COLOR_RGB2BGR)
 
     return vis
+
+def lane_post_optimize(all_coords, original_widths, original_heights, input_width, input_height):
+    '''
+    '''
+    # 去除异常点
+
+    # 拟合
+    
+    # 映射到原图中
+    for b in range(len(all_coords)):
+        scale_x = original_widths[b] / input_width
+        scale_y = original_heights[b] / input_height
+
+        for i in range(len(all_coords[b])):
+            lane = all_coords[b][i]
+            if len(lane) == 0:
+                continue
+            pts = np.array(lane, dtype=np.float32)
+            pts[:, 0] *= scale_x
+            pts[:, 1] *= scale_y
+            all_coords[b][i] = pts
+
+    all_lane_labels = all_coords
+    return all_coords, all_lane_labels
 
 
 def run_video_mode(session, input_name, output_names, image_list, args):
@@ -712,15 +744,17 @@ def run_video_mode(session, input_name, output_names, image_list, args):
         input_data = np.stack(batch_numpys, axis=0).astype(np.float32)
         pred = onnx_inference(session, input_name, output_names, input_data)
 
-        all_coords, all_lane_labels = pred2coords(pred, original_image_widths=original_widths, original_image_heights=original_heights, predict_next_num=2, straight_error=3)
+        all_coords, all_lane_labels = pred2coords(pred, original_image_widths=original_widths, original_image_heights=original_heights, train_width=args.train_width, resize_mode='train')
 
+        all_coords, all_filter_coords = lane_post_optimize(all_coords, original_widths, original_heights, args.train_width, args.train_height/args.crop_ratio)
+       
         for b in range(len(valid_paths)):
             img_path = valid_paths[b]
             vis = cv2.imread(img_path)
             if vis is None:
                 continue
 
-            vis = draw_lane_on_image(vis, all_coords[b], all_lane_labels[b])
+            vis = draw_lane_on_image(vis, all_coords[b], all_filter_coords[b], all_lane_labels[b])
             vout.write(vis)
 
     vout.release()

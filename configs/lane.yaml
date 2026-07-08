@@ -288,7 +288,7 @@ img_size: 640
 # batch_size: 128
 # batch_size: 256
 #
-batch_size: 16
+batch_size: 8
 
 
 
@@ -1390,7 +1390,7 @@ wandb_project: "lane_detect"
 # wandb_tags: []
 # wandb_tags: ["baseline", "resnet50"]
 #
-wandb_tags: ["benchmark"]
+wandb_tags: ["multi gpu"]
 
 
 

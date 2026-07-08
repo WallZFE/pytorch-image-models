@@ -87,12 +87,6 @@ def process_lane_shape(shape):
             print(f"跳过 shape: points 为空或数据异常")
             return None
         
-        # 检查是否有 y < 115 的点
-        for point in shape['points']:
-            if int(point[1]) < 115:
-                print(f"跳过 shape (group_id: {shape.get('group_id')}): 存在 y < 115 的点 y={int(point[1])}")
-                return None
-        
         # 检查group_id是否有值且在1-4范围内
         group_id = shape.get('group_id')
         if group_id is None or group_id not in [1, 2, 3, 4]:
