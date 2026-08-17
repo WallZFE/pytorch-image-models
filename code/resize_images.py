@@ -57,5 +57,5 @@ def process_images(source_folder, result_folder, num):
 if __name__ == "__main__":
     source_folder = "../../data/model_use/images"
     result_folder = "/data/zhifu/Project/export/XMIPC/data"
-    num = 256
+    num = 512
     process_images(source_folder, result_folder, num)

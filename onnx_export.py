@@ -72,7 +72,8 @@ def main():
     print("==> Creating PyTorch {} model".format(args.model))
     # NOTE exportable=True flag disables autofn/jit scripted activations and uses Conv2dSameExport layers
     # for models using SAME padding
-    if args.model == "lane_net_18":
+    lane_models = {"lane_net_18", "lane_net_resnet18", "lane_net_mobilenetv3_large", "lane_net_regnetx_004"}
+    if args.model in lane_models:
         model = timm.create_model(
             args.model,
             num_classes=args.num_classes,
@@ -130,7 +131,7 @@ def main():
     else:
         input_size = None
 
-    if args.model == "lane_net_18": 
+    if args.model in lane_models:
         onnx_export(
             model,
             args.output,

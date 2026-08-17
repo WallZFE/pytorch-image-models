@@ -1,0 +1,12 @@
+# Bird's Eye View Homography Matrix (3x3)
+# BEV Output Size: 600 x 800
+# Source points (original image):
+#   Point 1: (1.85, 244.17)
+#   Point 2: (609.02, 244.18)
+#   Point 3: (282.13, 126.02)
+#   Point 4: (316.4, 126.0)
+#
+# Matrix values (row-major, 9 floats):
+-1.0404464645 -2.4681873580 604.5821286670
+-0.0041529616 -7.1172920149 898.0927908948
+-0.0000051994 -0.0083944402 1.0000000000

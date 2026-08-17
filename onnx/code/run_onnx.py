@@ -10,13 +10,25 @@ import math
 from natsort import natsorted
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
+import shutil
+import re
 
-ROW_COORDS = [115, 118, 120, 123, 125, 128, 130, 133, 136, 139,
-              141, 144, 147, 150, 153, 156, 160, 163, 166, 170,
-              173, 177, 181, 184, 188, 192, 197, 201, 205, 209,
-              214, 218, 223, 228, 233, 238, 243, 248, 253, 258,
-              263, 269, 274, 280, 285, 291, 297, 302, 308, 314,
-              320, 326, 333, 339, 345, 350, 355, 359]
+LANE_LABEL_NUM = 8
+LANE_LABEL_INDEX_DIC= {"单": 0, "单行": 0, "单列": 0,
+                        "多": 1, "多行": 1, "多列": 1, "双": 1, "双行": 1, "双列": 1,
+                        "白": 2, "白色": 2, 
+                        "黄": 3, "黄色": 3, 
+                        "实": 4, "实线": 4, "左实右实": 4, "双实线": 4, "实实线": 4,
+                        "虚": 5, "虚线": 5, "左虚右虚": 5, "双虚线": 5, "虚虚线": 5,
+                        "实虚": 6, "实虚线": 6, "左实右虚": 6, "左实右虚线": 6, 
+                        "虚实": 7, "虚实线": 7, "左虚右实": 7, "左虚右实线": 7,
+                    }
+ROW_COORDS = [126, 128, 130, 132, 134, 137, 139, 142, 144, 147,
+              149, 152, 155, 158, 161, 164, 167, 170, 173, 176,
+              180, 183, 187, 190, 194, 197, 201, 204, 208, 212,
+              216, 220, 224, 228, 233, 237, 242, 246, 251, 256,
+              261, 266, 271, 276, 282, 287, 293, 298, 304, 310,
+              316, 322, 328, 335, 341, 347, 353, 359]
 
 MEAN = [0.5, 0.5, 0.5]
 STD = [0.5, 0.5, 0.5]
@@ -321,9 +333,9 @@ def bce_with_logits_loss_np(logits, targets):
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='ONNX车道线检测推理')
-    parser.add_argument('--mode', type=str, default='json', choices=['json', 'video', 'eval'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss')
+    parser.add_argument('--mode', type=str, default='json', choices=['json', 'video', 'eval', 'move'], help='运行模式: json=保存坐标JSON, video=生成视频, eval=计算测试集Loss, move=真实跟预测比较并移动')
     parser.add_argument('--onnx_model', type=str, default="../model/output_model.onnx", help='ONNX模型文件路径')
-    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose", help='图片目录路径')
+    parser.add_argument('--demo_data_root', type=str, default="../../../data/test", help='图片目录路径')
     parser.add_argument('--test_txt', type=str, default="../../../data/model_use/TUSimple/test.txt", help='eval模式下使用的 test.txt 图片列表文件路径')
     parser.add_argument('--cache_path', type=str, default="../../../data/model_use/TUSimple/tusimple_anno_cache_test.json", help='测试集GT标注缓存JSON路径 (eval模式需要)')
     parser.add_argument('--train_height', type=int, default=288, help='模型输入高度')
@@ -406,7 +418,7 @@ def find_output_key(pred, target_key):
 
 # ==================== 核心推理后处理 ====================
 
-def pred2coords(pred, local_width=5, original_image_widths=None, original_image_heights=None, train_width=None, train_height=None, resize_mode='original'):
+def pred2coords(pred, local_width=5, original_image_widths=None, original_image_heights=None, train_width=None, resize_mode='original'):
     """
     预测结果转坐标
     :param pred: ONNX输出的字典
@@ -423,6 +435,21 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
     max_indices_row = np.argmax(loc_row, axis=1)  # (B, num_cls_row, num_lane_row)
     valid_row = np.argmax(exist_row, axis=1)       # (B, num_cls_row, num_lane_row)
 
+    # ============ 对 exist_row 做 softmax，转换为概率 ============
+    # 数值稳定版 softmax（防止 exp 溢出）
+    exist_max = np.max(exist_row, axis=1, keepdims=True)          # (B, 1, 58, 4)
+    exp_exist = np.exp(exist_row - exist_max)                     # (B, 2, 58, 4)
+    exist_softmax = exp_exist / np.sum(exp_exist, axis=1, keepdims=True)  # (B, 2, 58, 4)
+
+    # ============  取出"存在"（index=1）的概率 ============
+    exist_prob = exist_softmax[:, 1, :, :]                        # (B, 58, 4)
+    # 每个值 ∈ [0, 1]，表示该锚点存在车道线的概率
+
+    # ============ 用 valid_row 做掩码，只看存在的点 ============
+    # valid_row 已经是 (B, 58, 4)，值为 0 或 1
+    valid_prob = exist_prob * valid_row                            # (B, 58, 4)
+    # 不存在的点概率被置零，存在的点保留其概率值
+
     # 获取车道线属性标签
     lane_label_raw = find_output_key(pred, 'lane_label')
     lane_label_prob = sigmoid_np(lane_label_raw)  # (B, 4, 8)
@@ -431,6 +458,7 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
     # 预分配结果
     all_coords = [[] for _ in range(batch_size)]
     all_lane_labels = [{} for _ in range(batch_size)]
+    all_scores = [[] for _ in range(batch_size)]
 
     row_lane_idx = [0, 1, 2, 3]
 
@@ -440,9 +468,11 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
 
         coords = []
         lane_labels = {}
+        scores = []
 
         for i in row_lane_idx:
             tmp = []
+            tmp_scores = []
             if valid_row[b, :, i].sum() > 0:
                 for k in range(valid_row.shape[1]):
                     if valid_row[b, k, i]:
@@ -461,19 +491,24 @@ def pred2coords(pred, local_width=5, original_image_widths=None, original_image_
                             out_tmp = out_tmp / (num_grid_row - 1) * train_width
                             y_val = int(ROW_COORDS[k])
                         tmp.append((int(out_tmp), y_val))
+                        tmp_scores.append(valid_prob[b, k, i])
+                for tmp_n in range(len(lane_label_index_dic)):
+                    if lane_label[b, i, tmp_n]:
+                        if str(i) not in lane_labels:
+                            lane_labels[str(i)] = []
+                        lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
+            if len(tmp) <= 6:
+                tmp = []
+                tmp_scores = []
+                lane_labels[str(i)] = []
 
             coords.append(tmp)
-
-            for tmp_n in range(len(lane_label_index_dic)):
-                if lane_label[b, i, tmp_n]:
-                    if str(i) not in lane_labels:
-                        lane_labels[str(i)] = []
-                    lane_labels[str(i)].append(lane_label_index_dic[tmp_n])
+            scores.append(tmp_scores)
 
         all_coords[b] = coords
         all_lane_labels[b] = lane_labels
-
-    return all_coords, all_lane_labels
+        all_scores[b] = scores
+    return all_coords, all_lane_labels, all_scores
 
 
 # ==================== JSON 模式 ====================
@@ -599,7 +634,7 @@ def run_json_mode(session, input_name, output_names, image_list, args):
         pred = onnx_inference(session, input_name, output_names, input_data)
 
         # 后处理
-        all_coords, all_lane_labels = pred2coords(pred, original_image_widths=original_widths,original_image_heights=original_heights)
+        all_coords, all_lane_labels, all_scores = pred2coords(pred, original_image_widths=original_widths,original_image_heights=original_heights)
 
         # 保存JSON
         for b in range(len(valid_paths)):
@@ -759,6 +794,423 @@ def run_video_mode(session, input_name, output_names, image_list, args):
 
     vout.release()
     print("✅ 视频模式处理完成!")
+
+# ==================== MOVE 模式 ====================
+def process_lane_shape(shape):
+    """
+    处理单个车道形状数据, 返回处理后的字典或None
+    
+    Args:
+        shape: 包含车道信息的字典
+        
+    Returns:
+        dict: 处理后的字典, 包含points、label、lane_label
+        None: 如果不符合条件需要跳过
+    """
+    try:
+        # 检查points是否有值
+        if not shape.get('points') or len(shape['points']) < 2:
+            print(f"跳过 shape: points 为空或数据异常")
+            return None
+        
+        # 检查group_id是否有值且在1-4范围内
+        group_id = shape.get('group_id')
+        if group_id is None or group_id not in [1, 2, 3, 4]:
+            print(f"跳过 shape (当前group_id: {group_id}): group_id 必须在 [1, 2, 3, 4] 范围内")
+            return None
+        
+        # 3. 检查label，按空格或逗号分割，必须等于3部分
+        label_str = shape.get('label', '').strip()
+        if not label_str:
+            print(f"跳过 shape (group_id: {group_id}): label 为空或长度")
+            return None
+        # 使用正则表达式分割，支持中文逗号、英文逗号、空格、中文空格
+        parts = re.split(r'[,\s，\s]+', label_str)
+        parts = [part.strip() for part in parts if part.strip()]  # 过滤空字符串并清理
+        if len(parts) != 3:
+            print(f"跳过 shape (group_id: {group_id}): label '{label_str}' 分割后长度为 {len(parts)},必须等于3。分割结果: {parts}")
+            return None
+        
+        # 4. 生成lane_label向量 (8个0)
+        lane_label_vector = [0] * LANE_LABEL_NUM
+        
+        # 5. 根据分割后的parts设置对应位置为1
+        for part in parts:
+            try:
+                index = LANE_LABEL_INDEX_DIC[part]
+                if 0 <= index < LANE_LABEL_NUM:
+                    lane_label_vector[index] = 1
+                else:
+                    print(f"跳过 shape (group_id: {group_id}): label部分 '{part}' 对应的索引 {index} 超出范围 [0, {LANE_LABEL_NUM-1}]")
+                    return None
+            except KeyError:
+                print(f"跳过 shape (group_id: {group_id}): label部分 '{part}' 不在 LANE_LABEL_INDEX_DIC 中。可用键: {list(LANE_LABEL_INDEX_DIC.keys())[:10]}...")
+                return None
+        
+        # 6. 构建返回的字典
+        result = {
+            'points': np.array(shape['points']),
+            'label': group_id,
+            'lane_label': lane_label_vector,
+            'original_label': label_str,
+            'label_parts': parts
+        }
+        return result
+        
+    except Exception as e:
+        print(f"处理 shape 时发生错误: {str(e)}")
+        print(f"有问题的 shape 数据: {shape}")
+        return None
+
+def convert_lane_data(lane_data):
+    """
+    将 lane_data 转换成与 coords 和 lane_labels 相同的格式。
+    固定输出 4 条车道线（索引 0, 1, 2, 3），没有的用空列表占位。
+
+    参数:
+        lane_data:              原始车道数据列表
+
+    返回:
+        converted_coords:       list of list of tuples，固定长度 4
+        converted_lane_labels:  dict，固定包含 key '0', '1', '2', '3'
+    """
+    # 固定 4 个车道线，初始化为空
+    converted_coords = [[] for _ in range(4)]
+    converted_lane_labels = {str(i): [] for i in range(4)}
+
+    for item in lane_data:
+        label = item['label']  # label 值为 1, 2, 3, 4
+
+        # label 超出 1~4 范围则跳过
+        if label < 1 or label > 4:
+            continue
+
+        # label 1 -> 索引 0, label 2 -> 索引 1, ...
+        index = label - 1
+
+        # ========== 坐标转换: numpy array -> list of (x, y) tuples ==========
+        points_array = item['points']
+        coord_list = [(int(pt[0]), int(pt[1])) for pt in points_array]
+        converted_coords[index] = coord_list
+
+        # ========== 标签转换: lane_label + lane_label_index_dic -> 文字列表 ==========
+        label_list = [lane_label_index_dic[i] for i, val in enumerate(item['lane_label']) if val == 1]
+        converted_lane_labels[str(index)] = label_list
+
+    return converted_coords, converted_lane_labels
+
+def check_label_mismatch(lane_labels, model_lane_labels):
+    """
+    标签是否完全一致
+    key 和 value 必须一模一样，少一个 key 或 value 里有一个不对都返回 True
+    返回 True = 有差异
+    """
+    # key 数量不一致
+    if set(lane_labels.keys()) != set(model_lane_labels.keys()):
+        return True
+
+    # 逐个 key 比较 value
+    for key in lane_labels:
+        gt_labels = lane_labels[key]
+        pred_labels = model_lane_labels.get(key, [])
+
+        # 长度不同 或 内容不同
+        if gt_labels != pred_labels:
+            return True
+
+    return False
+
+def _find_bracket_index(sorted_ys, target_y):
+    """在排序后的 ys 中找到 target_y 所在区间的左索引"""
+    left, right = 0, len(sorted_ys) - 2
+    result = None
+    while left <= right:
+        mid = (left + right) // 2
+        if sorted_ys[mid] <= target_y <= sorted_ys[mid + 1]:
+            return mid
+        elif target_y < sorted_ys[mid]:
+            right = mid - 1
+        else:
+            left = mid + 1
+    return result
+
+def check_coord_deviation(coords, model_coords, threshold=4):
+    """
+    坐标偏差检查（以预测为主）
+    遍历预测坐标的每个点 (px, py)，
+    在对应的真实车道线中，找到 y 值最接近 py 的两个点，
+    线性插值求出 gt_x，比较 |px - gt_x|。
+    若任意一点偏差 > threshold，返回 True。
+
+    返回 True = 有差异
+    """
+    num_lanes = min(len(coords), len(model_coords))
+
+    for i in range(num_lanes):
+        gt_pts = coords[i]        # 真实坐标 list of (x, y)
+        pred_pts = model_coords[i]  # 预测坐标 list of (x, y)
+
+        # 真实坐标按 y 排序，方便插值
+        gt_sorted = sorted(gt_pts, key=lambda p: p[1])
+        gt_ys = [p[1] for p in gt_sorted]
+        gt_xs = [p[0] for p in gt_sorted]
+
+        for (px, py) in pred_pts:
+            # 预测点的 y 在真实 y 范围之外 → 无法插值，算错误
+            if py < gt_ys[0] or py > gt_ys[-1]:
+                return True
+
+            # 找到 py 所在的区间 [gt_ys[j], gt_ys[j+1]]
+            # 使用二分查找
+            j = _find_bracket_index(gt_ys, py)
+            if j is None:
+                return True
+
+            # 线性插值求 gt_x
+            y0, y1 = gt_ys[j], gt_ys[j + 1]
+            x0, x1 = gt_xs[j], gt_xs[j + 1]
+
+            if y1 == y0:
+                gt_x = (x0 + x1) / 2.0
+            else:
+                ratio = (py - y0) / (y1 - y0)
+                gt_x = x0 + ratio * (x1 - x0)
+
+            # 比较 x 偏差
+            if abs(px - gt_x) > threshold:
+                return True
+
+    return False
+
+def check_y_range_coverage(coords, model_coords, min_coverage=0.8):
+    """
+    Y 范围覆盖率检查
+    检查预测车道线在 Y 方向上是否覆盖了真实车道线的足够范围。
+    如果覆盖率 < min_coverage，返回 True。
+
+    目的：防止模型预测的车道线太短，只覆盖了一小段。
+    返回 True = 有差异
+    """
+    num_lanes = min(len(coords), len(model_coords))
+
+    for i in range(num_lanes):
+        gt_pts = coords[i]
+        pred_pts = model_coords[i]
+
+        gt_ys = [p[1] for p in gt_pts]
+        pred_ys = [p[1] for p in pred_pts]
+
+        gt_y_range = max(gt_ys) - min(gt_ys)
+        pred_y_range = max(pred_ys) - min(pred_ys)
+
+        if gt_y_range == 0:
+            continue
+
+        coverage = pred_y_range / gt_y_range
+        if coverage < min_coverage:
+            return True
+
+    return False
+
+def check_overall_avg_deviation(coords, model_coords, max_avg_deviation=5):
+    """
+    整体平均偏差检查
+    计算所有预测点与真实线的平均 x 偏差。
+    如果平均偏差 > max_avg_deviation，返回 True。
+
+    目的：即使没有单点超过阈值 10，但整体偏移大也应该报错。
+    返回 True = 有差异
+    """
+    num_lanes = min(len(coords), len(model_coords))
+    all_devs = []
+
+    for i in range(num_lanes):
+        gt_pts = coords[i]
+        pred_pts = model_coords[i]
+
+        gt_sorted = sorted(gt_pts, key=lambda p: p[1])
+        gt_ys = [p[1] for p in gt_sorted]
+        gt_xs = [p[0] for p in gt_sorted]
+
+        for (px, py) in pred_pts:
+            if py < gt_ys[0] or py > gt_ys[-1]:
+                continue
+
+            j = _find_bracket_index(gt_ys, py)
+            if j is None:
+                continue
+
+            y0, y1 = gt_ys[j], gt_ys[j + 1]
+            x0, x1 = gt_xs[j], gt_xs[j + 1]
+
+            if y1 == y0:
+                gt_x = (x0 + x1) / 2.0
+            else:
+                ratio = (py - y0) / (y1 - y0)
+                gt_x = x0 + ratio * (x1 - x0)
+
+            all_devs.append(abs(px - gt_x))
+
+    if len(all_devs) == 0:
+        return True  # 没有可比较的点，算异常
+
+    avg_dev = sum(all_devs) / len(all_devs)
+    if avg_dev > max_avg_deviation:
+        return True
+
+    return False
+
+
+def check_error_point_ratio(coords, model_coords, threshold=10, max_ratio=0.3):
+    """
+    超差点占比检查
+    统计偏差 > threshold 的点占总预测点的比例。
+    如果比例 > max_ratio，返回 True。
+
+    目的：允许少量点偏差大（比如端点），但比例太高说明整体不好。
+    返回 True = 有差异
+    """
+    num_lanes = min(len(coords), len(model_coords))
+    total_points = 0
+    error_points = 0
+
+    for i in range(num_lanes):
+        gt_pts = coords[i]
+        pred_pts = model_coords[i]
+
+        gt_sorted = sorted(gt_pts, key=lambda p: p[1])
+        gt_ys = [p[1] for p in gt_sorted]
+        gt_xs = [p[0] for p in gt_sorted]
+
+        for (px, py) in pred_pts:
+            total_points += 1
+
+            if py < gt_ys[0] or py > gt_ys[-1]:
+                error_points += 1
+                continue
+
+            j = _find_bracket_index(gt_ys, py)
+            if j is None:
+                error_points += 1
+                continue
+
+            y0, y1 = gt_ys[j], gt_ys[j + 1]
+            x0, x1 = gt_xs[j], gt_xs[j + 1]
+
+            if y1 == y0:
+                gt_x = (x0 + x1) / 2.0
+            else:
+                ratio = (py - y0) / (y1 - y0)
+                gt_x = x0 + ratio * (x1 - x0)
+
+            if abs(px - gt_x) > threshold:
+                error_points += 1
+
+    if total_points == 0:
+        return True
+
+    error_ratio = error_points / total_points
+    if error_ratio > max_ratio:
+        return True
+
+    return False
+
+# 函数名： 比较模型跟真实json的结果
+def compare_json_coords(json_path, coords, lane_labels):
+    """
+    比较json跟模型的坐标是否一致
+    """
+    # 读取json文件
+    with open(json_path, 'r') as f:
+        json_data = json.load(f)
+    
+    lane_data = []
+    for shape in json_data['shapes']:
+        if shape['shape_type'] == 'linestrip':
+            processed_shape = process_lane_shape(shape)
+            if processed_shape is not None:
+                lane_data.append(processed_shape)
+            else:
+                return True
+
+    model_coords, model_lane_labels = convert_lane_data(lane_data)
+    
+    # 比较标签是否一致
+    if check_label_mismatch(lane_labels, model_lane_labels):
+        return True
+    
+    # # 比较坐标偏差一致
+    # if check_coord_deviation(coords, model_coords):
+    #     return True
+    
+    # # 比较Y范围覆盖率一致
+    # if check_y_range_coverage(coords, model_coords):
+    #     return True
+    
+    # # 比较整体平均偏差一致
+    # if check_overall_avg_deviation(coords, model_coords):
+    #     return True
+    
+    # # 比较超差点占比一致
+    # if check_error_point_ratio(coords, model_coords):
+    #     return True
+    
+    return False
+
+def run_move_mode(session, input_name, output_names, image_list, args):
+    """MOVE模式: 真实跟预测比较并移动图片"""
+    batch_size = args.batch_size
+
+    save_path = args.save_path
+    os.makedirs(save_path, exist_ok=True)
+
+    total_batches = math.ceil(len(image_list) / batch_size)
+    print(f'[MOVE模式] 共 {len(image_list)} 张图片, {total_batches} 个batch')
+
+    for batch_start in tqdm(range(0, len(image_list), batch_size), total=total_batches, desc='处理中'):
+        batch_paths = image_list[batch_start:batch_start + batch_size]
+
+        # 预处理batch
+        batch_numpys = []
+        original_widths = []
+        original_heights = []
+        valid_paths = []
+        json_paths = []
+
+        for img_path in batch_paths:
+            img_transposed, h, w = preprocess_image(img_path, args.train_height, args.train_width, args.crop_ratio)
+
+            json_path = img_path.replace('.jpg', '.json')
+            if not os.path.exists(json_path):
+                continue
+
+            original_heights.append(h)
+            original_widths.append(w)
+            valid_paths.append(img_path)
+            batch_numpys.append(img_transposed)
+            json_paths.append(json_path)
+
+        if len(batch_numpys) == 0:
+            continue
+
+        # 组batch并推理
+        input_data = np.stack(batch_numpys, axis=0).astype(np.float32)
+        pred = onnx_inference(session, input_name, output_names, input_data)
+
+        # 后处理
+        all_coords, all_lane_labels, all_scores = pred2coords(pred, original_image_widths=original_widths, original_image_heights=original_heights)
+
+        # 比较模型跟真实json的结果
+        for b in range(len(valid_paths)):
+            json_path = json_paths[b]
+            img_path = valid_paths[b]
+
+            # 返回true 就把图片和json文件移动到save_path
+            if compare_json_coords(json_path, all_coords[b], all_lane_labels[b]):
+                shutil.move(img_path, os.path.join(save_path, os.path.basename(img_path)))
+                shutil.move(json_path, os.path.join(save_path, os.path.basename(json_path)))
+
+    print("✅ MOVE模式处理完成!")
 
 # ==================== 获取真实信息 ====================
 
@@ -1289,6 +1741,8 @@ def main():
         run_video_mode(session, input_name, output_names, image_list, args)
     elif args.mode == 'eval':
         run_eval_mode(session, input_name, output_names, image_list, args)
+    elif args.mode == 'move':
+        run_move_mode(session, input_name, output_names, image_list, args)
     else:
         print(f"未知的模式: {args.mode}")
 

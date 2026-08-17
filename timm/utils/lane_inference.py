@@ -2,6 +2,46 @@ import torch
 import numpy as np
 import math
 
+
+# Canonical decoder contract. Board-side implementations should reproduce these
+# values and rules exactly when they are updated independently.
+DEFAULT_LOCAL_WIDTH = 5
+GRID_CELL_OFFSET = 0.0
+MIN_LANE_POINTS = 1
+
+
+def _local_expected_index(logits, max_idx, num_grid, local_width):
+    """Refine argmax indices without duplicating boundary bins.
+
+    Near grid boundaries only the in-range neighbours participate in softmax.
+    Clamping the indices before softmax would duplicate bin 0 / bin C-1 and bias
+    the expectation towards the boundary.
+    """
+    if local_width < 0:
+        raise ValueError(f"local_width must be non-negative, got {local_width}")
+
+    device = logits.device
+    batch_size, _, num_anchors, num_lanes = logits.shape
+    offsets = torch.arange(-local_width, local_width + 1, device=device)
+    local_indices = max_idx.unsqueeze(-1) + offsets.view(1, 1, 1, -1)
+    in_bounds = (local_indices >= 0) & (local_indices < num_grid)
+    gather_indices = local_indices.clamp(0, num_grid - 1)
+
+    batch_indices = torch.arange(batch_size, device=device).view(batch_size, 1, 1, 1)
+    anchor_indices = torch.arange(num_anchors, device=device).view(1, num_anchors, 1, 1)
+    lane_indices = torch.arange(num_lanes, device=device).view(1, 1, num_lanes, 1)
+
+    local_logits = logits[
+        batch_indices,
+        gather_indices,
+        anchor_indices,
+        lane_indices,
+    ]
+    local_logits = local_logits.masked_fill(~in_bounds, float('-inf'))
+    weights = local_logits.softmax(dim=-1)
+    return (weights * gather_indices.to(weights.dtype)).sum(dim=-1) + GRID_CELL_OFFSET
+
+
 def process_row_lanes(loc_row, valid_row, max_idx_row, lane_indices, row_anchor_t, img_w, num_grid_row, H_row, local_width):
     device = loc_row.device
     B = loc_row.shape[0]
@@ -22,21 +62,8 @@ def process_row_lanes(loc_row, valid_row, max_idx_row, lane_indices, row_anchor_
     v = v.bool()
     m = m.long()
 
-    offsets = torch.arange(-local_width, local_width + 1, device=device)
-    all_ind = m.unsqueeze(-1) + offsets.view(1, 1, 1, -1)
-    all_ind = all_ind.clamp(0, num_grid_row - 1)
-
-    b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
-    h_idx = torch.arange(H_row, device=device).view(1, H_row, 1, 1)
-    l_idx = lane_idx_t.view(1, 1, num_lanes, 1)
-
-    b_e = b_idx.expand(B, H_row, num_lanes, all_ind.shape[-1])
-    h_e = h_idx.expand(B, H_row, num_lanes, all_ind.shape[-1])
-    l_e = l_idx.expand(B, H_row, num_lanes, all_ind.shape[-1])
-
-    logits = loc_row[b_e, all_ind, h_e, l_e]
-    weights = logits.softmax(dim=-1)
-    refined = (weights * all_ind.float()).sum(dim=-1)# + 0.5
+    selected_logits = loc_row[:, :, :H_row, :][:, :, :, lane_idx_t]
+    refined = _local_expected_index(selected_logits, m, num_grid_row, local_width)
 
     x = refined / (num_grid_row - 1) * img_w
     x = x.permute(0, 2, 1)
@@ -70,21 +97,8 @@ def process_col_lanes(loc_col, valid_col, max_idx_col, lane_indices, col_anchor_
     v = v.bool()
     m = m.long()
 
-    offsets = torch.arange(-local_width, local_width + 1, device=device)
-    all_ind = m.unsqueeze(-1) + offsets.view(1, 1, 1, -1)
-    all_ind = all_ind.clamp(0, num_grid_col - 1)
-
-    b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
-    h_idx = torch.arange(H_col, device=device).view(1, H_col, 1, 1)
-    l_idx = lane_idx_t.view(1, 1, num_lanes, 1)
-
-    b_e = b_idx.expand(B, H_col, num_lanes, all_ind.shape[-1])
-    h_e = h_idx.expand(B, H_col, num_lanes, all_ind.shape[-1])
-    l_e = l_idx.expand(B, H_col, num_lanes, all_ind.shape[-1])
-
-    logits = loc_col[b_e, all_ind, h_e, l_e]
-    weights = logits.softmax(dim=-1)
-    refined = (weights * all_ind.float()).sum(dim=-1) #+ 0.5
+    selected_logits = loc_col[:, :, :H_col, :][:, :, :, lane_idx_t]
+    refined = _local_expected_index(selected_logits, m, num_grid_col, local_width)
 
     y = refined / (num_grid_col - 1) * img_h
     y = y.permute(0, 2, 1)
@@ -98,7 +112,15 @@ def process_col_lanes(loc_col, valid_col, max_idx_col, lane_indices, col_anchor_
 
     return coords
 
-def pred2coords(pred, row_anchor, col_anchor, image_widths, image_heights, local_width=5):
+def pred2coords(
+        pred,
+        row_anchor,
+        col_anchor,
+        image_widths,
+        image_heights,
+        local_width=DEFAULT_LOCAL_WIDTH,
+        min_lane_points=MIN_LANE_POINTS,
+):
     device = pred['loc_row'].device
     B = pred['loc_row'].shape[0]
     num_grid_row = pred['loc_row'].shape[1]
@@ -142,13 +164,17 @@ def pred2coords(pred, row_anchor, col_anchor, image_widths, image_heights, local
     valid_row = pred['exist_row'].argmax(1)
     # valid_col = pred['exist_col'].argmax(1)
 
-    lane_label = None
-    if 'lane_label' in pred and pred['lane_label'] is not None:
-        lane_label = (pred['lane_label'].sigmoid() > 0.5)  # (B, 4, 8) bool tensor
-
     row_lane_idx = [0, 1, 2, 3]
     # 返回的 row_coords 是 GPU Tensor: (B, 4, H_row, 2)
     row_coords = process_row_lanes(pred['loc_row'], valid_row, max_idx_row, row_lane_idx, row_anchor_t, img_w, num_grid_row, H_row, local_width)
+
+    # Attribute logits are meaningful only for a lane that exists. Training uses
+    # the same rule: an all-zero attribute target denotes an absent lane.
+    lane_label = None
+    if 'lane_label' in pred and pred['lane_label'] is not None:
+        lane_label = pred['lane_label'].sigmoid() > 0.5
+        lane_present = valid_row[:, :H_row, row_lane_idx].sum(dim=1) >= min_lane_points
+        lane_label = lane_label & lane_present.unsqueeze(-1)
 
     # col_lane_idx = [0, 3]
     # # 返回的 col_coords 是 GPU Tensor: (B, 2, H_col, 2)
@@ -157,7 +183,7 @@ def pred2coords(pred, row_anchor, col_anchor, image_widths, image_heights, local
 
     return row_coords, col_coords, lane_label
 
-def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
+def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height, return_tensors=False):
     """
     全 GPU Tensor 向量化评估。无 for 循环，速度极快。
     """
@@ -179,7 +205,7 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
     # 指标 A: 车道线级准确率 (8个属性全对才算1)
     lane_match = torch.all(p_lab == g_lab, dim=-1)
     ll_lane_correct = lane_match.sum().float()
-    ll_lane_total = float(B * 4)
+    ll_lane_total = ll_lane_correct.new_tensor(B * p_lab.shape[1])
 
     # 指标 B: 属性级准确率 (多标签二分类)
     ll_attr_tp = (p_lab & g_lab).sum().float()
@@ -225,23 +251,25 @@ def lane_test(pred, gt, row_anchor, col_anchor, train_width, train_height):
 
     # ================= 只返回原始计数 =================
     results = {
-        'll_lane_correct': ll_lane_correct.item(),
+        'll_lane_correct': ll_lane_correct,
         'll_lane_total':   ll_lane_total,
 
-        'll_attr_tp': ll_attr_tp.item(),
-        'll_attr_fp': ll_attr_fp.item(),
-        'll_attr_fn': ll_attr_fn.item(),
-        'll_attr_tn': ll_attr_tn.item(),
+        'll_attr_tp': ll_attr_tp,
+        'll_attr_fp': ll_attr_fp,
+        'll_attr_fn': ll_attr_fn,
+        'll_attr_tn': ll_attr_tn,
 
-        'row_tp': row_tp.item(),
-        'row_fp': row_fp.item(),
-        'row_fn': row_fn.item(),
+        'row_tp': row_tp,
+        'row_fp': row_fp,
+        'row_fn': row_fn,
 
         # 'col_tp': col_tp.item(),
         # 'col_fp': col_fp.item(),
         # 'col_fn': col_fn.item(),
     }
-    return results
+    if return_tensors:
+        return results
+    return {key: value.item() for key, value in results.items()}
 
 def _calc_f1(tp, fp, fn):
     pr = tp / max(tp + fp, 1e-6)

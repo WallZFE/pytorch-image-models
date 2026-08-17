@@ -28,6 +28,9 @@ class LaneDataset(data.Dataset):
             split='train',
             num_cell_row=100,
             num_cell_col=100,
+            debug_ratio=0.01,
+            debug_max=10,
+            debug_dir="output/debug_vis",
             **kwargs,
     ):
         super(LaneDataset, self).__init__()
@@ -39,13 +42,18 @@ class LaneDataset(data.Dataset):
         self.train_width    = train_width
         self.top_crop       = top_crop
 
-        self.debug_ratio    = 0.05
-        self.debug_max      = 10
+        if not 0.0 <= debug_ratio <= 1.0:
+            raise ValueError(f"debug_ratio must be in [0, 1], got {debug_ratio}")
+        if debug_max < 0:
+            raise ValueError(f"debug_max must be non-negative, got {debug_max}")
+
+        self.debug_ratio    = debug_ratio
+        self.debug_max      = debug_max
+        self.debug_dir      = os.fspath(debug_dir)
         self.debug_count    = 0
         
         if row_anchor is None or col_anchor is None:
-            _logger.error("LaneDataset anchors cannot be None!")
-            exit(-1)
+            raise ValueError("LaneDataset row_anchor and col_anchor cannot be None")
             
         self.interp_loc_row = np.array(row_anchor, dtype=np.float32)
         self.interp_loc_col = np.array(col_anchor, dtype=np.float32)
@@ -60,7 +68,7 @@ class LaneDataset(data.Dataset):
             cache_path = os.path.join(self.root, 'tusimple_anno_cache_test.json')
 
         with open(list_path, 'r') as f:
-            self.list = f.readlines()
+            self.list = [line for line in f if line.strip()]
 
         with open(cache_path, 'r') as f:
             self.cached_points = json.load(f)
@@ -68,10 +76,10 @@ class LaneDataset(data.Dataset):
         self.aug = A.Compose([
                 A.Affine(
                     scale={"x": (0.9, 1.1), "y": (0.9, 1.1)},
-                    rotate=(-10, 10),
-                    translate_px={"x": (-15, 15), "y": (-45, 45)},
+                    rotate=(-7, 7),
+                    translate_px={"x": (-10, 10), "y": (-25, 25)},
                     fit_output=False,
-                    p=0.6,
+                    p=0.4,
                 ),
                 # A.Perspective(
                 #     scale=(0.02, 0.05),
@@ -86,28 +94,28 @@ class LaneDataset(data.Dataset):
                 A.OneOf([
                     A.RandomBrightnessContrast(),
                     A.CLAHE(),
-                ], p=0.3),
+                ], p=0.15),
 
                 # 颜色增强
                 A.HueSaturationValue(
-                    hue_shift_limit=10,
-                    sat_shift_limit=20,
-                    val_shift_limit=10,
-                    p=0.2,
+                    hue_shift_limit=5,
+                    sat_shift_limit=10,
+                    val_shift_limit=5,
+                    p=0.1,
                 ),
 
                 # 模糊/噪声
                 A.OneOf([
                     A.MotionBlur(blur_limit=5),
                     A.GaussNoise(noise_scale_factor=0.1),
-                ], p=0.25),
+                ], p=0.15),
 
                 A.CoarseDropout(
                     num_holes_range=(1, 5),
-                    hole_height_range=(20, 60),
-                    hole_width_range=(40, 120),
-                    fill_value=114,
-                    p=0.09,
+                    hole_height_range=(10, 40),
+                    hole_width_range=(30, 90),
+                    fill=114,
+                    p=0.05,
                 )
             ],
             keypoint_params=A.KeypointParams(format="xy", remove_invisible=False),
@@ -128,31 +136,43 @@ class LaneDataset(data.Dataset):
         # 读取图片
         img_path = os.path.join(self.root, img_name)
         img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError( f"Failed to read lane image at index {index}: {img_path}" )
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img_h, img_w, _ = img.shape
 
         # 读取坐标
-        infos = self.cached_points[img_name]
+        try:
+            infos = self.cached_points[img_name]
+        except KeyError as exc:
+            raise KeyError( f"Annotation cache does not contain image {img_name!r} at index {index}" ) from exc
         # points shape: (num_lanes, num_points, 2) -> 通常是 (4, N, 2) 并且y从小到大排序
-        points = np.array(infos["points"]).astype(np.float32)
+        points = np.asarray(infos["points"], dtype=np.float32)
+        lane_label = np.asarray(infos["lane_label"], dtype=np.float32)
+        if points.ndim != 3 or points.shape[-1] != 2:
+            raise ValueError( f"Invalid points shape for {img_name!r}: expected [num_lanes, num_points, 2], " f"got {points.shape}")
+        if lane_label.ndim != 2 or lane_label.shape[0] != points.shape[0]:
+            raise ValueError( f"Invalid lane_label shape for {img_name!r}: points has {points.shape[0]} lanes, " f"lane_label has shape {lane_label.shape}")
+        if points.shape[0] != 4:
+            raise ValueError( f"LaneDataset expects exactly 4 lanes, got {points.shape[0]} for {img_name!r}" )
+
         sort_indices = np.argsort(points[:, :, 1], axis=1)
         points = np.take_along_axis(points, sort_indices[:, :, np.newaxis], axis=1)
 
-        lane_label = np.array(infos["lane_label"]).astype(np.float32)
-
-        img_raw = img.copy()
-        points_raw = points.copy()
-        lane_label_raw = lane_label.copy()
+        # _transform never mutates these input arrays in-place, so debug references do not
+        # require an unconditional full image/annotation copy for every training sample.
+        img_raw = img
+        points_raw = points
+        lane_label_raw = lane_label
         
         # 数据增强与归一化
         img, points, lane_label, img_aug = self._transform(img, points, lane_label)
 
         if (self.split == 'train' and self.debug_count < self.debug_max and np.random.rand() < self.debug_ratio):
             self.debug_count += 1
-            save_dir = "output/debug_vis"
-            os.makedirs(save_dir, exist_ok=True)
-            save_path_raw = os.path.join(save_dir, f"{os.path.splitext(img_name)[0].replace('/', '-')}_{index}.jpg")
-            save_path_aug = os.path.join(save_dir, f"aug_{index}.jpg")
+            os.makedirs(self.debug_dir, exist_ok=True)
+            save_path_raw = os.path.join(self.debug_dir, f"{os.path.splitext(img_name)[0].replace('/', '-')}_{index}.jpg")
+            save_path_aug = os.path.join(self.debug_dir, f"aug_{index}.jpg")
             self.draw_lanes(cv2.cvtColor(img_raw, cv2.COLOR_RGB2BGR), points_raw.copy(), lane_label_raw.copy(), save_path_raw)
             self.draw_lanes(cv2.cvtColor(img_aug, cv2.COLOR_RGB2BGR), points.copy(), lane_label.copy(), save_path_aug)
 
@@ -172,11 +192,12 @@ class LaneDataset(data.Dataset):
         points_row = self._my_interp_cpu(points, self.interp_loc_row, direction=0)
         if self.split == 'train':
             # points_row_extend shape: (H_row, num_lanes)
-            points_row_extend = self._extend(points_row[:, :, 0]).transpose(0, 1) 
+            # points_row_extend = self._extend(points_row[:, :, 0]).transpose(0, 1)
+            points_row_extend = torch.from_numpy(points_row[:, :, 0]).transpose(0, 1)
         else:
             # Row Coords (num_lanes, H_row, 2)
             row_coords = torch.from_numpy(points_row).float()
-            invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] > img_w)
+            invalid_x = (row_coords[..., 0] < 0) | (row_coords[..., 0] >= img_w)
             row_coords[..., 0] = torch.where(invalid_x, torch.full_like(row_coords[..., 0], -10000.0), row_coords[..., 0])
             target["row_coords"] = row_coords
 
@@ -184,7 +205,7 @@ class LaneDataset(data.Dataset):
             points_row_extend = torch.from_numpy(points_row[:, :, 0]).transpose(0, 1) 
 
         labels_row = (points_row_extend / img_w * (self.num_cell_row - 1)).round().long()
-        labels_row[(points_row_extend < 0) | (points_row_extend > img_w)] = -1
+        labels_row[(points_row_extend < 0) | (points_row_extend >= img_w)] = -1
         labels_row[(labels_row < 0) | (labels_row > (self.num_cell_row - 1))] = -1
 
         # labels_row 对应车道线 0, 1, 2, 3
@@ -200,7 +221,7 @@ class LaneDataset(data.Dataset):
         if self.split != 'train':
             # Col Coords (num_lanes, H_col, 2)
             col_coords = torch.from_numpy(points_col).float()
-            invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] > img_h)
+            invalid_y = (col_coords[..., 1] < 0) | (col_coords[..., 1] >= img_h)
             col_coords[..., 1] = torch.where(invalid_y, torch.full_like(col_coords[..., 1], -10000.0), col_coords[..., 1])
             target["col_coords"] = col_coords
 
@@ -208,10 +229,11 @@ class LaneDataset(data.Dataset):
         points_col_y = torch.from_numpy(points_col[:, :, 1]).transpose(0, 1)
 
         labels_col = (points_col_y / img_h * (self.num_cell_col - 1)).round().long()
-        labels_col[(points_col_y < 0) | (points_col_y > img_h)] = -1
+        labels_col[(points_col_y < 0) | (points_col_y >= img_h)] = -1
         labels_col[(labels_col < 0) | (labels_col > (self.num_cell_col - 1))] = -1
 
-        ## 全用row，不使用col
+        # 训练阶段保留 col 标签；lane_label 有效性仍按 row 结果判断。
+        # ONNX 推理阶段不使用 col。
         # # labels_col 对应车道线 0, 3
         # # labels_col shape: (H_col, num_lanes) → 取第 0, 3 列
         # for lane_idx in [0, 3]:
@@ -237,22 +259,30 @@ class LaneDataset(data.Dataset):
 
     def _transform(self, img, points, lane_label):
         lane_num, point_num, _ = points.shape
-        lane_label = lane_label.copy() 
+        points = points.copy()
+        lane_label = lane_label.copy()
+        valid_keypoint_mask = ((points[:, :, 0] >= 0) & (points[:, :, 0] < img.shape[1]) & (points[:, :, 1] >= 0) & (points[:, :, 1] < img.shape[0]))
 
         if self.split == 'train':
-            do_flip = np.random.random() < 0.3
+            do_flip = np.random.random() < 0.2
             
             if do_flip:
                 img = np.ascontiguousarray(img[:, ::-1, :])
-                points = points.copy()
                 points[:, :, 0] = img.shape[1] - 1 - points[:, :, 0]
                 points = np.ascontiguousarray(points[::-1])                   # 翻转车道线顺序
+                valid_keypoint_mask = np.ascontiguousarray(valid_keypoint_mask[::-1])
                 lane_label = np.ascontiguousarray(lane_label[::-1])            # 翻转标签
+                lane_label[:, [6, 7]] = lane_label[:, [7, 6]]                  # 实虚线 <-> 虚实线
 
-            keypoints = points.reshape(-1, 2).tolist()
+            # Only valid annotation points participate in geometric augmentation.
+            # Otherwise a missing-point placeholder such as (-1, -1) can be moved
+            # into the image by an affine translation and become a fake lane point.
+            keypoints = points[valid_keypoint_mask].tolist()
             transformed = self.aug(image=img, keypoints=keypoints)
             img_aug  = transformed["image"]
-            points = np.array(transformed["keypoints"], dtype=np.float32).reshape(lane_num, point_num, 2)
+            transformed_points = np.asarray(transformed["keypoints"], dtype=np.float32).reshape(-1, 2)
+            points = np.full((lane_num, point_num, 2), -1.0, dtype=np.float32)
+            points[valid_keypoint_mask] = transformed_points
         else:
             img_aug = img.copy()
         
@@ -276,44 +306,72 @@ class LaneDataset(data.Dataset):
         Returns:
             [lane_num, new_point_num, 2]
         """
+        if direction not in (0, 1):
+            raise ValueError(f"direction must be 0 or 1, got {direction}")
+
         lane_num, point_num, _ = points.shape
+        interp_loc = np.asarray(interp_loc, dtype=np.float32)
         new_point_num = len(interp_loc)
         output = np.full((lane_num, new_point_num, 2), -1.0, dtype=np.float32)
 
         inv_dir = 1 - direction
-        
+        output[:, :, inv_dir] = interp_loc[None, :]
+
+        if point_num < 2 or new_point_num == 0:
+            return output
+
         for l in range(lane_num):
             lane = points[l]
             lane_dir = lane[:, direction]
             lane_inv = lane[:, inv_dir]
-            
-            for k, current_loc in enumerate(interp_loc):
-                output[l, k, inv_dir] = current_loc
-                pos = -1
-                
-                for i in range(point_num - 1, 0, -1):
-                    v1 = lane_inv[i]
-                    v2 = lane_inv[i - 1]
-                    if lane_dir[i] < 0 or lane_dir[i - 1] < 0 or v1 < 0 or v2 < 0:
-                        continue
-                    if (v1 - current_loc) * (v2 - current_loc) <= 0:
-                        pos = i
-                        break
 
-                if pos == -1:
-                    continue
-                    
-                p1_dir, p0_dir = lane_dir[pos], lane_dir[pos - 1]
-                p1_inv, p0_inv = lane_inv[pos], lane_inv[pos - 1]
-                
-                length = abs(p1_inv - p0_inv)
-                if length < 1e-6:
-                    continue
+            p1_dir = lane_dir[1:]
+            p0_dir = lane_dir[:-1]
+            p1_inv = lane_inv[1:]
+            p0_inv = lane_inv[:-1]
+            valid_segments = (
+                (p1_dir >= 0)
+                & (p0_dir >= 0)
+                & (p1_inv >= 0)
+                & (p0_inv >= 0)
+            )
+            if not np.any(valid_segments):
+                continue
 
-                factor1 = 1.0 - abs(p1_inv - current_loc) / length
-                factor2 = 1.0 - factor1
-                output[l, k, direction] = p1_dir * factor1 + p0_dir * factor2
-                
+            # Match the original reverse scan: if more than one segment crosses an
+            # anchor, select the segment with the greatest point index.
+            crossings = valid_segments[None, :] & (
+                (p1_inv[None, :] - interp_loc[:, None])
+                * (p0_inv[None, :] - interp_loc[:, None])
+                <= 0
+            )
+            matched_anchor = np.any(crossings, axis=1)
+            if not np.any(matched_anchor):
+                continue
+
+            matched_indices = np.flatnonzero(matched_anchor)
+            reversed_segment = np.argmax(crossings[matched_anchor, ::-1], axis=1)
+            segment_indices = crossings.shape[1] - 1 - reversed_segment
+
+            selected_p1_inv = p1_inv[segment_indices]
+            selected_p0_inv = p0_inv[segment_indices]
+            lengths = np.abs(selected_p1_inv - selected_p0_inv)
+            non_degenerate = lengths >= 1e-6
+            if not np.any(non_degenerate):
+                continue
+
+            matched_indices = matched_indices[non_degenerate]
+            segment_indices = segment_indices[non_degenerate]
+            lengths = lengths[non_degenerate]
+            current_locs = interp_loc[matched_indices]
+
+            factor1 = 1.0 - np.abs(p1_inv[segment_indices] - current_locs) / lengths
+            factor2 = 1.0 - factor1
+            output[l, matched_indices, direction] = (
+                p1_dir[segment_indices] * factor1
+                + p0_dir[segment_indices] * factor2
+            )
+
         return output
 
     def _extend(self, coords):

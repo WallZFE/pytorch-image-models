@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from contextlib import suppress
 from datetime import datetime
 from functools import partial
@@ -106,6 +106,29 @@ group.add_argument('--target-key', default=None, type=str,
                    help='Dataset key for target labels.')
 group.add_argument('--dataset-trust-remote-code', action='store_true', default=False,
                    help='Allow huggingface dataset import to execute code downloaded from the dataset\'s repo.')
+
+# Lane detection geometry. These arguments are intentionally explicit instead of
+# relying on arbitrary YAML keys injected through ``set_defaults``. The same
+# values are validated once and then shared by the model, dataset, and metrics.
+group = parser.add_argument_group('Lane detection parameters')
+group.add_argument('--num-cls-row', type=int, default=None,
+                   help='Number of row anchors/classes for lane detection.')
+group.add_argument('--num-grid-row', type=int, default=None,
+                   help='Number of row-coordinate grid cells for lane detection.')
+group.add_argument('--num-lane-on-row', type=int, default=None,
+                   help='Number of row-predicted lanes (currently must be 4).')
+group.add_argument('--row-anchor', type=int, nargs='+', default=None,
+                   help='Row-anchor y coordinates in the resized pre-crop image.')
+group.add_argument('--num-cls-col', type=int, default=None,
+                   help='Number of column anchors/classes for lane detection.')
+group.add_argument('--num-grid-col', type=int, default=None,
+                   help='Number of column-coordinate grid cells for lane detection.')
+group.add_argument('--num-lane-on-col', type=int, default=None,
+                   help='Number of column-predicted lanes (currently must be 4).')
+group.add_argument('--col-anchor', type=int, nargs='+', default=None,
+                   help='Column-anchor x coordinates in the resized image.')
+group.add_argument('--top-crop', type=float, default=None,
+                   help='Bottom image-height fraction retained after resizing, in (0, 1].')
 
 # Model parameters
 group = parser.add_argument_group('Model parameters')
@@ -457,9 +480,92 @@ def _parse_args():
     return args, args_text
 
 
+def _validate_lane_args(args, input_size=None):
+    if args.dataset != 'lane':
+        return
+
+    errors = []
+    positive_int_names = (
+        'num_cls_row', 'num_lane_on_row',
+        'num_cls_col', 'num_lane_on_col',
+    )
+    for name in positive_int_names:
+        value = getattr(args, name, None)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            errors.append(f'{name} must be a positive integer, got {value!r}')
+
+    # Decoding normalizes coordinate indices by ``num_grid - 1``.
+    for name in ('num_grid_row', 'num_grid_col'):
+        value = getattr(args, name, None)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 2:
+            errors.append(f'{name} must be an integer >= 2, got {value!r}')
+
+    # The dataset annotations and lane-attribute head/loss currently use four
+    # fixed lane slots. Reject inconsistent configs instead of silently creating
+    # incompatible model and target shapes.
+    for name in ('num_lane_on_row', 'num_lane_on_col'):
+        value = getattr(args, name, None)
+        if isinstance(value, int) and value != 4:
+            errors.append(f'{name} must be 4 for the current lane dataset/head, got {value}')
+
+    top_crop = getattr(args, 'top_crop', None)
+    if not isinstance(top_crop, (int, float)) or isinstance(top_crop, bool) or not 0 < top_crop <= 1:
+        errors.append(f'top_crop must be in (0, 1], got {top_crop!r}')
+
+    for anchor_name, cls_name in (('row_anchor', 'num_cls_row'), ('col_anchor', 'num_cls_col')):
+        anchors = getattr(args, anchor_name, None)
+        num_cls = getattr(args, cls_name, None)
+        if not isinstance(anchors, (list, tuple)) or not anchors:
+            errors.append(f'{anchor_name} must be a non-empty list of coordinates')
+            continue
+        if isinstance(num_cls, int) and len(anchors) != num_cls:
+            errors.append(
+                f'len({anchor_name}) must equal {cls_name} ({num_cls}), got {len(anchors)}')
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in anchors):
+            errors.append(f'{anchor_name} must contain only numeric coordinates')
+        elif any(a >= b for a, b in zip(anchors, anchors[1:])):
+            errors.append(f'{anchor_name} must be strictly increasing')
+
+    if input_size is not None and len(input_size) == 3 and isinstance(top_crop, (int, float)) and top_crop > 0:
+        input_height, input_width = input_size[1], input_size[2]
+        full_height = int(input_height / top_crop)
+        if isinstance(args.row_anchor, (list, tuple)) and any(
+                y < 0 or y >= full_height for y in args.row_anchor):
+            errors.append(
+                f'row_anchor coordinates must be in [0, {full_height - 1}] for '
+                f'input height {input_height} and top_crop {top_crop}')
+        if isinstance(args.col_anchor, (list, tuple)) and any(
+                x < 0 or x >= input_width for x in args.col_anchor):
+            errors.append(f'col_anchor coordinates must be in [0, {input_width - 1}]')
+
+    if errors:
+        raise ValueError('Invalid lane configuration:\n  - ' + '\n  - '.join(errors))
+
+
+def _create_lane_dataset(args, split, data_config):
+    from timm.data.lane_dataset import LaneDataset
+
+    return LaneDataset(
+        root=args.data_dir,
+        split=split,
+        row_anchor=args.row_anchor,
+        col_anchor=args.col_anchor,
+        mean=data_config['mean'],
+        std=data_config['std'],
+        train_height=data_config['input_size'][1],
+        train_width=data_config['input_size'][2],
+        top_crop=args.top_crop,
+        # LaneDataset calls these values ``num_cell_*`` while the model and
+        # configuration call them ``num_grid_*``. Map them explicitly.
+        num_cell_row=args.num_grid_row,
+        num_cell_col=args.num_grid_col,
+    )
+
+
 def main():
     utils.setup_default_logging(log_path='./training.log')
     args, args_text = _parse_args()
+    _validate_lane_args(args)
 
     if args.device_modules:
         for module in args.device_modules:
@@ -516,6 +622,34 @@ def main():
             num_classes=-1,  # force head adaptation
         )
 
+    model_kwargs = dict(args.model_kwargs)
+    if args.dataset == 'lane':
+        lane_model_kwargs = dict(
+            num_cls_row=args.num_cls_row,
+            num_grid_row=args.num_grid_row,
+            num_lane_on_row=args.num_lane_on_row,
+            num_cls_col=args.num_cls_col,
+            num_grid_col=args.num_grid_col,
+            num_lane_on_col=args.num_lane_on_col,
+        )
+        if args.input_size is not None:
+            lane_model_kwargs.update(
+                input_height=args.input_size[1],
+                input_width=args.input_size[2],
+            )
+        elif args.img_size is not None:
+            lane_model_kwargs.update(input_height=args.img_size, input_width=args.img_size)
+
+        conflicts = [
+            name for name, value in lane_model_kwargs.items()
+            if name in model_kwargs and model_kwargs[name] != value
+        ]
+        if conflicts:
+            raise ValueError(
+                'Lane geometry must have one source of truth; conflicting --model-kwargs: '
+                + ', '.join(conflicts))
+        model_kwargs.update(lane_model_kwargs)
+
     model = create_model(
         args.model,
         pretrained=args.pretrained,
@@ -530,7 +664,7 @@ def main():
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint,
         **factory_kwargs,
-        **args.model_kwargs,
+        **model_kwargs,
     )
     if args.head_init_scale is not None:
         with torch.no_grad():
@@ -555,6 +689,7 @@ def main():
 
     data_config = resolve_data_config(vars(args), model=model, verbose=utils.is_primary(args))
     args.data_config = data_config
+    _validate_lane_args(args, data_config['input_size'])
 
     # setup augmentation batch splits for contrastive loss or split bn
     num_aug_splits = 0
@@ -631,14 +766,7 @@ def main():
         input_img_mode = args.input_img_mode
 
     if args.dataset == "lane":
-        from timm.data.lane_dataset import LaneDataset
-        dataset_train = LaneDataset(
-                root=args.data_dir,
-                split=args.train_split,
-                train_height=data_config["input_size"][1],
-                train_width=data_config["input_size"][2],
-                **vars(args),
-            )
+        dataset_train = _create_lane_dataset(args, args.train_split, data_config)
     else:
         dataset_train = create_dataset(
             args.dataset,
@@ -660,14 +788,7 @@ def main():
     dataset_eval = None
     if args.val_split:
         if args.dataset == "lane":
-            from timm.data.lane_dataset import LaneDataset
-            dataset_eval = LaneDataset(
-                    root=args.data_dir,
-                    split=args.val_split,
-                    train_height=data_config["input_size"][1],
-                    train_width=data_config["input_size"][2],
-                    **vars(args),
-                )
+            dataset_eval = _create_lane_dataset(args, args.val_split, data_config)
         else:
             dataset_eval = create_dataset(
                 args.dataset,
@@ -1238,8 +1359,15 @@ def train_one_epoch(
         num_updates_total=None,
         naflex_mode=False,
 ):
-    metric_sums = defaultdict(float)  # 用于累加各项 loss 的总和
-    num_batches = 0                   # 记录 batch 数量
+    # Keep loss statistics on device throughout the epoch. Converting every
+    # scalar with .item() serializes the training stream, and reducing every log
+    # point introduces avoidable DDP collectives. One packed reduction at epoch
+    # end produces the exact global summary used for checkpoint/W&B reporting.
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    loss_sample_count = torch.zeros((), device=device, dtype=torch.float64)
+    metric_sums = {}
+    num_batches = 0
+    last_loss = torch.zeros((), device=device, dtype=torch.float64)
     
     if args.mixup_off_epoch and epoch >= args.mixup_off_epoch:
         if args.prefetcher and loader.mixup_enabled:
@@ -1251,7 +1379,6 @@ def train_one_epoch(
     has_no_sync = args.distributed and hasattr(task.get_trainable_module(), 'no_sync')
     update_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
-    losses_m = utils.AverageMeter()
 
     trainable_module = task.get_trainable_module()
     trainable_module.train()
@@ -1374,13 +1501,23 @@ def train_one_epoch(
                 loss, result = _forward()
                 _backward(loss)
                 
-        if result.get("loss_items") is not None:
-            for k, v in result["loss_items"].items():
-                val = v.item() if isinstance(v, torch.Tensor) else float(v)
-                metric_sums[k] += val       
+        loss_for_stats = loss.detach().to(torch.float64) * accum_steps
+        loss_sum.add_(loss_for_stats * batch_size)
+        loss_sample_count.add_(batch_size)
+        last_loss = loss_for_stats
+
+        loss_items = result.get("loss_items")
+        if loss_items is not None:
+            for k, v in loss_items.items():
+                value = torch.as_tensor(v, device=device).detach().to(torch.float64)
+                if value.numel() != 1:
+                    raise ValueError(f'loss_items[{k!r}] must be scalar, got shape {tuple(value.shape)}')
+                value = value.reshape(())
+                if k not in metric_sums:
+                    metric_sums[k] = torch.zeros((), device=device, dtype=torch.float64)
+                metric_sums[k].add_(value)
         num_batches += 1
 
-        losses_m.update(loss.item() * accum_steps, batch_size)
         update_sample_count += global_batch_size
 
         if not need_update:
@@ -1401,41 +1538,44 @@ def train_one_epoch(
         update_time_m.update(time.time() - update_start_time)
         update_start_time = time_now
 
-        if update_idx % args.log_interval == 0 or last_batch:
+        if utils.is_primary(args) and (update_idx % args.log_interval == 0 or last_batch):
             lrl = [param_group['lr'] for param_group in optimizer.param_groups]
             lr = sum(lrl) / len(lrl)
 
-            loss_avg, loss_now = losses_m.avg, losses_m.val
-            if args.distributed:
-                # synchronize current step and avg loss, each process keeps its own running avg
-                loss_avg = utils.reduce_tensor(loss.new([loss_avg]), args.world_size).item()
-                loss_now = utils.reduce_tensor(loss.new([loss_now]), args.world_size).item()
+            # Live logs intentionally show rank-0-local loss. The epoch summary
+            # below is globally reduced and is the value used for model selection.
+            loss_avg_tensor = loss_sum / loss_sample_count.clamp_min(1.)
+            loss_now, loss_avg = torch.stack((last_loss, loss_avg_tensor)).cpu().tolist()
 
-            if utils.is_primary(args):
-                _logger.info(
-                    f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
-                    f'({100. * (update_idx + 1) / updates_per_epoch:>3.0f}%)]  '
-                    f'Loss: {loss_now:#.3g} ({loss_avg:#.3g})  '
-                    f'Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  '
-                    f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
-                    f'LR: {lr:.3e}  '
-                    f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
+            _logger.info(
+                f'Train: {epoch} [{update_idx:>4d}/{updates_per_epoch} '
+                f'({100. * (update_idx + 1) / updates_per_epoch:>3.0f}%)]  '
+                f'Loss: {loss_now:#.3g} ({loss_avg:#.3g})  '
+                f'Time: {update_time_m.val:.3f}s, {update_sample_count / update_time_m.val:>7.2f}/s  '
+                f'({update_time_m.avg:.3f}s, {update_sample_count / update_time_m.avg:>7.2f}/s)  '
+                f'LR: {lr:.3e}  '
+                f'Data: {data_time_m.val:.3f} ({data_time_m.avg:.3f})'
+            )
+
+            if args.save_images and output_dir:
+                torchvision.utils.save_image(
+                    input,
+                    os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
+                    padding=0,
+                    normalize=True
                 )
-
-                if args.save_images and output_dir:
-                    torchvision.utils.save_image(
-                        input,
-                        os.path.join(output_dir, 'train-batch-%d.jpg' % batch_idx),
-                        padding=0,
-                        normalize=True
-                    )
 
         if saver is not None and args.recovery_interval and (
                 (update_idx + 1) % args.recovery_interval == 0):
             saver.save_recovery(epoch, batch_idx=update_idx)
 
         if lr_scheduler is not None:
-            lr_scheduler.step_update(num_updates=num_updates, metric=losses_m.avg)
+            lr_scheduler.step_update(
+                num_updates=num_updates,
+                # Update-based schedulers do not consume the metric; passing
+                # None also avoids retaining a device tensor in scheduler state.
+                metric=None,
+            )
 
         update_sample_count = 0
         data_start_time = time.time()
@@ -1444,18 +1584,23 @@ def train_one_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    loss_avg = losses_m.avg
+    metric_keys = sorted(metric_sums)
+    packed_stats = torch.stack([
+        loss_sum,
+        loss_sample_count,
+        loss_sum.new_tensor(num_batches),
+        *(metric_sums[k] for k in metric_keys),
+    ])
     if args.distributed:
-        # synchronize avg loss, each process keeps its own running avg
-        loss_avg = torch.tensor([loss_avg], device=device, dtype=torch.float32)
-        loss_avg = utils.reduce_tensor(loss_avg, args.world_size).item()
+        torch.distributed.all_reduce(packed_stats, op=torch.distributed.ReduceOp.SUM)
+    packed_values = packed_stats.cpu().tolist()
 
-    num_batches = max(num_batches, 1) 
-    
+    global_sample_count = max(packed_values[1], 1.)
+    global_num_batches = max(packed_values[2], 1.)
     train_metrics = OrderedDict()
-    train_metrics['loss'] = loss_avg
-    for k, v in metric_sums.items():
-        train_metrics[k] = v / num_batches
+    train_metrics['loss'] = packed_values[0] / global_sample_count
+    for index, key in enumerate(metric_keys, start=3):
+        train_metrics[key] = packed_values[index] / global_num_batches
     
     return train_metrics
 
@@ -1545,23 +1690,28 @@ def validate_lane(
         model_dtype=None,
         log_suffix=''
 ):
-    batch_time_m        = utils.AverageMeter()
-    losses_m            = utils.AverageMeter()
-
-    counts = {
-        'll_lane_correct': 0.0, 'll_lane_total': 0.0,
-        'll_attr_tp': 0.0, 'll_attr_fp': 0.0, 'll_attr_fn': 0.0, 'll_attr_tn': 0.0,
-        'row_tp': 0.0, 'row_fp': 0.0, 'row_fn': 0.0,
-        # 'col_tp': 0.0, 'col_fp': 0.0, 'col_fn': 0.0,
-    }
+    count_keys = (
+        'll_lane_correct', 'll_lane_total',
+        'll_attr_tp', 'll_attr_fp', 'll_attr_fn', 'll_attr_tn',
+        'row_tp', 'row_fp', 'row_fn',
+    )
+    count_sums = torch.zeros(len(count_keys), device=device, dtype=torch.float64)
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    loss_sample_count = torch.zeros((), device=device, dtype=torch.float64)
+    last_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    last_loss_sample_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
 
+    validation_start = time.time()
     end = time.time()
     last_idx = len(loader) - 1
+    last_batch_begin = end
     with torch.inference_mode():
         for batch_idx, (input, target) in enumerate(loader):
             last_batch = batch_idx == last_idx
+            if last_batch:
+                last_batch_begin = end
             if not args.prefetcher:
                 input = input.to(device=device, dtype=model_dtype)
                 if isinstance(target, dict):
@@ -1583,45 +1733,97 @@ def validate_lane(
             train_height    = int(int(args.data_config["input_size"][1]) / args.top_crop)
             train_width     = args.data_config["input_size"][2]
 
-            test_result = utils.lane_test(output, target, args.row_anchor, args.col_anchor, train_width, train_height)
+            test_result = utils.lane_test(
+                output,
+                target,
+                args.row_anchor,
+                args.col_anchor,
+                train_width,
+                train_height,
+                return_tensors=True,
+            )
 
-            if args.distributed:
-                reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
-                for k in test_result:
-                    t = torch.tensor(test_result[k],device=device)
-                    test_result[k] = utils.reduce_tensor(t,args.world_size).item()
-            else:
-                reduced_loss = loss.data
+            batch_counts = torch.stack([
+                torch.as_tensor(test_result[key], device=device, dtype=torch.float64).reshape(())
+                for key in count_keys
+            ])
+            count_sums.add_(batch_counts)
 
-            if device.type == 'cuda':
-                torch.cuda.synchronize()
-            elif device.type == "npu":
-                torch.npu.synchronize()
-            
-            losses_m.update(reduced_loss.item(), batch_size)
-            for k in counts:
-                counts[k] += test_result[k]
+            loss_value = loss.detach().to(torch.float64)
+            loss_sum.add_(loss_value * batch_size)
+            loss_sample_count.add_(batch_size)
+            last_loss_sum = loss_value * batch_size
+            last_loss_sample_count = loss_sample_count.new_tensor(batch_size)
 
-            batch_time_m.update(time.time() - end)
-            end = time.time()
-            if utils.is_primary(args) and batch_idx !=0 and (last_batch or batch_idx % args.log_interval == 0):
-                tmp = utils.lane_compute_metrics(counts)
+            should_log = (
+                utils.is_primary(args)
+                and batch_idx != 0
+                and not last_batch
+                and batch_idx % args.log_interval == 0
+            )
+            if should_log:
+                # Progress logs are local to rank 0. Final returned metrics are
+                # globally reduced exactly once after the loop.
+                local_values = torch.cat((
+                    loss_sum.reshape(1),
+                    loss_sample_count.reshape(1),
+                    count_sums,
+                )).cpu().tolist()
+                local_counts = dict(zip(count_keys, local_values[2:]))
+                tmp = utils.lane_compute_metrics(local_counts)
+                local_loss_avg = local_values[0] / max(local_values[1], 1.)
+
+                elapsed = time.time() - validation_start
+                avg_batch_time = elapsed / (batch_idx + 1)
                 log_name = 'Test' + log_suffix
+                if args.distributed:
+                    log_name += ' (rank 0 local)'
                 _logger.info(
                     f'********************************************************************\n'
                     f'{log_name}: [{batch_idx:>4d}/{last_idx}]\n'
-                    f'Time: {batch_time_m.val:.3f} ({batch_time_m.avg:.3f})\n'
-                    f'Loss: {losses_m.val:>7.3f} ({losses_m.avg:>6.3f})\n'
+                    f'Time: {avg_batch_time:.3f} ({avg_batch_time:.3f})\n'
+                    f'Loss: {local_loss_avg:>7.3f} ({local_loss_avg:>6.3f})\n'
                     f'LaneAcc: {tmp["ll_lane_acc"]:.6f}\n'
                     f'LaneAttrF1: {tmp["ll_attr_f1"]:.6f}\n'
                     f'RowF1: {tmp["row_f1"]:.6f}\n'
-                    # f'ColF1: {tmp["col_f1"]:.6f}\n'
                     f'lane_total_f1: {tmp["lane_total_f1"]:.6f}\n'
                     f'********************************************************************\n'
                 )
 
+            end = time.time()
+
+    packed_stats = torch.cat((
+        loss_sum.reshape(1),
+        loss_sample_count.reshape(1),
+        last_loss_sum.reshape(1),
+        last_loss_sample_count.reshape(1),
+        count_sums,
+    ))
+    if args.distributed:
+        torch.distributed.all_reduce(packed_stats, op=torch.distributed.ReduceOp.SUM)
+    packed_values = packed_stats.cpu().tolist()
+
+    counts = dict(zip(count_keys, packed_values[4:]))
     metrics = utils.lane_compute_metrics(counts)
-    metrics['loss'] = losses_m.avg
+    metrics['loss'] = packed_values[0] / max(packed_values[1], 1.)
+
+    if utils.is_primary(args):
+        validation_elapsed = time.time() - validation_start
+        avg_batch_time = validation_elapsed / max(len(loader), 1)
+        last_batch_time = time.time() - last_batch_begin
+        last_loss = packed_values[2] / max(packed_values[3], 1.)
+        log_name = 'Test' + log_suffix
+        _logger.info(
+            f'********************************************************************\n'
+            f'{log_name}: [{last_idx:>4d}/{last_idx}]\n'
+            f'Time: {last_batch_time:.3f} ({avg_batch_time:.3f})\n'
+            f'Loss: {last_loss:>7.3f} ({metrics["loss"]:>6.3f})\n'
+            f'LaneAcc: {metrics["ll_lane_acc"]:.6f}\n'
+            f'LaneAttrF1: {metrics["ll_attr_f1"]:.6f}\n'
+            f'RowF1: {metrics["row_f1"]:.6f}\n'
+            f'lane_total_f1: {metrics["lane_total_f1"]:.6f}\n'
+            f'********************************************************************\n'
+        )
 
     return metrics
 

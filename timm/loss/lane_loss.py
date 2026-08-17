@@ -8,6 +8,34 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
+
+def _distributed_global_means(local_sums, local_counts):
+    """Return global means while preserving the gradients of local numerators.
+
+    DDP averages gradients across ranks. Scaling each local numerator by
+    world_size / global_count therefore produces the gradient of the true
+    global mean, including when different ranks have different valid counts.
+    The detached correction makes the reported scalar value the same global
+    mean on every rank without trying to backpropagate through all_reduce.
+    """
+    local_counts = local_counts.to(device=local_sums.device, dtype=local_sums.dtype)
+
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        stats = torch.cat((local_sums.detach(), local_counts.detach()))
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        num_terms = local_sums.numel()
+        global_sums = stats[:num_terms]
+        global_counts = stats[num_terms:]
+        denominators = global_counts.clamp_min(1.0)
+
+        gradient_terms = local_sums * (world_size / denominators)
+        global_values = global_sums / denominators
+        return gradient_terms + (global_values - gradient_terms.detach())
+
+    return local_sums / local_counts.clamp_min(1.0)
+
+
 class LaneLoss(nn.Module):
 
     def __init__(self, testing_mode=True):
@@ -17,7 +45,7 @@ class LaneLoss(nn.Module):
         self.cls_loss_weight = 1.0
 
         self.cls_loss_col = SoftmaxFocalLoss(2, ignore_lb=-1)
-        self.cls_loss_col_weight = 0.3
+        self.cls_loss_col_weight = 0.2
 
 
         self.relation_loss = ParsingRelationLoss()
@@ -38,13 +66,13 @@ class LaneLoss(nn.Module):
         self.mean_loss_row = MeanLoss()
         self.mean_loss_col = MeanLoss()
         self.mean_loss_row_weight = 1.0
-        self.mean_loss_col_weight = 0.3
+        self.mean_loss_col_weight = 0.1
 
         if testing_mode:
             self.lane_attr_loss = nn.BCEWithLogitsLoss()
         else:
             self.lane_attr_loss = LaneAttributeLoss(num_attrs=8)
-        self.lane_attr_loss_weight = 1.0
+        self.lane_attr_loss_weight = 0.6
 
     def forward(self, pred, target):
         cls_out_ext_label = (target['labels_row'] != -1).long()
@@ -165,85 +193,100 @@ class LaneAttributeLoss(nn.Module):
     def forward(self, pred_attr, target_attr):
         """
         pred_attr: (b, 4, 8) 模型输出的 logits
-        target_attr: (b, 4, 8) 真实标签 (0.0 或 1.0)
+        target_attr: (b, 4, 8) 真实标签；0/1 有效，负值忽略
         """
         b, num_lanes, num_attrs = target_attr.shape
         assert num_attrs == self.num_attrs, f"属性数量不匹配: 期望 {self.num_attrs}, 实际 {num_attrs}"
 
         # ==========================================
-        # 生成 Existence Mask (利用全0做Mask)
+        # 生成有效属性 Mask
         # ==========================================
-        # 存在的车道线必定有3个1，求和必定为3；不存在的车道线全0，求和为0
-        # exist_mask shape: (b, 4), bool 类型
-        exist_mask = target_attr.sum(dim=-1) > 0 
-        
-        # 如果当前 batch 没有任何存在的车道线，直接返回 0 loss
-        if not exist_mask.any():
-            return pred_attr.sum() * 0.0 
-
-        # 提取出“存在的车道线”的数据，shape: (N_valid, 8)
-        valid_pred = pred_attr[exist_mask]   
-        valid_target = target_attr[exist_mask] 
-        N_valid = valid_pred.shape[0]
+        # 数据集中全0表示“车道线不存在”，仍是有效的负标签；负值才表示该属性
+        # 未标注/需要忽略。先替换 ignore 值，避免它们参与 BCE 数值计算。
+        valid_attr_mask = target_attr >= 0
+        safe_target = torch.where(valid_attr_mask, target_attr, torch.zeros_like(target_attr))
 
         # ==========================================
         # 计算动态逐类别 Pos Weight (解决极端不平衡)
         # ==========================================
         with torch.no_grad():
-            # 统计当前 batch 中每个属性的正样本数量 (shape: 8)
-            batch_pos_count = valid_target.sum(dim=0) 
-            # 计算当前 batch 的正样本比例 (shape: 8)
-            batch_pos_ratio = batch_pos_count / N_valid
+            # 按属性统计 numerator/count；所有 rank 必须无条件参与同一次 collective。
+            local_pos_count = safe_target.sum(dim=(0, 1))
+            local_attr_count = valid_attr_mask.sum(dim=(0, 1)).to(target_attr.dtype)
+            global_stats = torch.cat((local_pos_count, local_attr_count))
 
-            # 支持多卡分布式训练(DDP)：同步所有卡的统计量
             if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(batch_pos_ratio, op=dist.ReduceOp.SUM)
-                batch_pos_ratio /= dist.get_world_size()
-            
-            # 冷启动优化：第一个 batch 直接赋值，后续使用 EMA
-            if self.update_count.item() == 0:
-                self.running_pos_ratio.copy_(batch_pos_ratio)
-            else:
-                self.running_pos_ratio.mul_(self.momentum).add_(batch_pos_ratio, alpha=1.0 - self.momentum)
-            
-            self.update_count += 1
+                dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
+
+            global_pos_count = global_stats[:self.num_attrs]
+            global_attr_count = global_stats[self.num_attrs:]
+            has_global_labels = global_attr_count > 0
+            batch_pos_ratio = torch.where(
+                has_global_labels,
+                global_pos_count / global_attr_count.clamp_min(1.0),
+                self.running_pos_ratio,
+            )
+
+            # 冷启动时直接使用首个全局 batch，后续使用 EMA。完全 ignore 的属性
+            # 保留原统计；不通过 .item() 引入每步 GPU 同步。
+            ema_ratio = self.running_pos_ratio * self.momentum + batch_pos_ratio * (1.0 - self.momentum)
+            updated_ratio = torch.where(self.update_count == 0, batch_pos_ratio, ema_ratio)
+            self.running_pos_ratio.copy_(
+                torch.where(has_global_labels, updated_ratio, self.running_pos_ratio)
+            )
+            self.update_count.add_(has_global_labels.any().to(self.update_count.dtype))
                 
             # 计算 pos_weight: (1 - p) / p。限制最大权重为 50，防止梯度爆炸
             # 对于前4个属性(p很大)，权重接近1；对于后4个属性(p极小)，权重会被放大
             dynamic_pos_weight = torch.clamp((1.0 - self.running_pos_ratio) / (self.running_pos_ratio + 1e-6), min=1.0, max=50.0) 
 
         # 基础 BCE Loss (不 reduction，保留每个样本每个属性的 loss)
-        # bce_loss shape: (N_valid, 8)
-        bce_loss = F.binary_cross_entropy_with_logits(valid_pred, valid_target, pos_weight=dynamic_pos_weight, reduction='none')
+        # 不存在的 lane 是全0有效负标签，因此也会在这里产生梯度。
+        bce_loss = F.binary_cross_entropy_with_logits(
+            pred_attr,
+            safe_target,
+            pos_weight=dynamic_pos_weight,
+            reduction='none',
+        )
 
         # ==========================================
         # 融合 Focal Loss 思想 (关注难样本)
         # ==========================================
         if self.gamma > 0:
             with torch.no_grad():
-                probs = torch.sigmoid(valid_pred).clamp(min=1e-7, max=1.0 - 1e-7)
+                probs = torch.sigmoid(pred_attr).clamp(min=1e-7, max=1.0 - 1e-7)
                 # p_t: 预测正确的概率 (标签为1取p，标签为0取1-p)
-                p_t = probs * valid_target + (1 - probs) * (1 - valid_target)
+                p_t = probs * safe_target + (1 - probs) * (1 - safe_target)
                 # focal_weight: 降低容易分类样本的权重
                 # 注：标准 Focal Loss 包含 alpha 平衡因子，但此处已通过 dynamic_pos_weight 
                 # 解决了正负样本不平衡，因此省略 alpha，避免权重重复叠加。
                 focal_weight = (1 - p_t) ** self.gamma
             bce_loss = bce_loss * focal_weight
 
-        # 对属性和样本求平均，得到最终的分类 Loss
-        loss_cls = bce_loss.mean()
+        local_cls_sum = (bce_loss * valid_attr_mask.to(bce_loss.dtype)).sum()
+        local_cls_count = valid_attr_mask.sum()
 
         # ==========================================
         # 先验正则化 (约束概率和趋近于 3)
         # ==========================================
-        # 只对存在的车道线计算正则化
-        probs = torch.sigmoid(valid_pred) # (N_valid, 8)
-        sum_probs = probs.sum(dim=-1)     # (N_valid,)
-        
-        # 既然存在的车道线必定有 3 个 1，那么概率和应该趋近于 3.0
-        # 使用 Smooth L1 或 L1 惩罚偏离 3.0 的程度
-        target_sum = valid_target.sum(dim=-1) 
-        loss_reg = F.mse_loss(sum_probs, target_sum)
+        # 只对完整标注且存在的车道线计算原有的“概率和趋近3”正则；
+        # 全0 absent lane 由上面的 BCE 明确监督，完全/部分 ignore lane 不进入正则。
+        fully_annotated_lane = valid_attr_mask.all(dim=-1)
+        present_lane = (safe_target > 0).any(dim=-1)
+        regularized_lane = fully_annotated_lane & present_lane
+        probs = torch.sigmoid(pred_attr)
+        sum_probs = probs.sum(dim=-1)
+        target_sum = safe_target.sum(dim=-1)
+        reg_loss = F.mse_loss(sum_probs, target_sum, reduction='none')
+        local_reg_sum = (reg_loss * regularized_lane.to(reg_loss.dtype)).sum()
+        local_reg_count = regularized_lane.sum()
+
+        # 使用全局 numerator/count 得到真正的 DDP 全局均值。即使某个 rank
+        # 完全没有有效标签，也会参与 collective 并返回可微的零。
+        loss_cls, loss_reg = _distributed_global_means(
+            torch.stack((local_cls_sum, local_reg_sum)),
+            torch.stack((local_cls_count, local_reg_count)),
+        ).unbind()
 
         # ==========================================
         # 综合 Loss
@@ -296,7 +339,8 @@ def soft_nll(pred, target, ignore_index = -1):
 
     target_fusion = 0.9 * target_onehot + 0.05 * target_l_onehot + 0.05 * target_r_onehot + 0.05 * supp_part_l_onehot + 0.05 * supp_part_r_onehot
     # import pdb; pdb.set_trace()
-    return -(target_fusion * pred).sum() / (target!=ignore_index).sum()
+    valid_count = (target != ignore_index).sum()
+    return -(target_fusion * pred).sum() / valid_count.clamp_min(1)
 
 class SoftmaxFocalLoss(nn.Module):
     def __init__(self, gamma, ignore_lb=255, soft_loss = True, *args, **kwargs):
@@ -305,7 +349,7 @@ class SoftmaxFocalLoss(nn.Module):
         self.ignore_lb = ignore_lb
         self.soft_loss = soft_loss
         if not self.soft_loss:
-            self.nll = nn.NLLLoss(ignore_index=ignore_lb)
+            self.nll = nn.NLLLoss(ignore_index=ignore_lb, reduction='sum')
 
 
     def forward(self, logits, labels):
@@ -316,7 +360,8 @@ class SoftmaxFocalLoss(nn.Module):
         if self.soft_loss:
             loss = soft_nll(log_score, labels, ignore_index = self.ignore_lb)
         else:
-            loss = self.nll(log_score, labels)
+            valid_count = (labels != self.ignore_lb).sum()
+            loss = self.nll(log_score, labels) / valid_count.clamp_min(1)
 
         # import pdb; pdb.set_trace()
         return loss
@@ -364,5 +409,6 @@ class MeanLoss(nn.Module):
         n,c,h,w = logits.shape
         grid = torch.arange(c, device=logits.device).view(1,c,1,1)
         logits = (logits.softmax(1) * grid).sum(1)
-        loss = self.l1(logits, label.float())[label != -1]
-        return loss.mean()
+        valid_mask = label != -1
+        loss = self.l1(logits, label.float())
+        return (loss * valid_mask.to(loss.dtype)).sum() / valid_mask.sum().clamp_min(1)
