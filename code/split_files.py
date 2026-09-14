@@ -182,7 +182,7 @@ if __name__ == "__main__":
     # 示例1：使用默认前缀 "folder" (folder_001, folder_002, ...)
     input_dir   = "../../data/dispose/images"
     output_dir  = "../../data/dispose/result"
-    split_num   = 50
+    split_num   = 100
     
     # 调用方式1：使用默认命名
     split_folder_with_json(input_dir, output_dir, split_num)

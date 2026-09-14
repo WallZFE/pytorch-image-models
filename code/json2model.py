@@ -842,7 +842,7 @@ def main(images_root, train_list, test_list, error_list, output_root, resize_siz
 
 if __name__ == "__main__":
     images_root = '../../data/model_use'
-    train_list  = ["20260417", "20260421", "20260429", "20260520", "20260525", "20260527", "20260603", "20260617", "20260630", "images"]
+    train_list  = ["images", "20260417", "20260421", "20260429", "20260603", "20260630"]
     test_list   = ["images_test"]
     error_list  = ['error_result']
     output_root = '../../data/model_use/TUSimple'

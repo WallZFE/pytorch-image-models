@@ -73,7 +73,7 @@ def create_video_from_images(folder_path, output_video_path, fps=30):
 # 使用示例
 if __name__ == "__main__":
     # 配置参数
-    input_folder = "/data/zhifu/Project/deploy/XMIPC/adas_shangqi_liu/XMIPCLinuxV100R003C00SPC030/sample/npu/xmm/result"  # 图片文件夹路径
+    input_folder = "/data/zhifu/Project/deploy/1221/adas_shangqi_liu/XMIPCLinuxV100R003C00SPC030/sample/npu/xmm/result"  # 图片文件夹路径
     output_video = "output_video.mp4"  # 输出视频路径
     
     # 生成视频

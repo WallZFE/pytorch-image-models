@@ -2,9 +2,13 @@ import os
 import glob
 import cv2
 import argparse
+import base64
+import json
 import numpy as np
 import onnxruntime as ort
 import math
+import re
+import shutil
 from natsort import natsorted
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
@@ -23,6 +27,16 @@ ROW_COORDS = [126, 128, 130, 132, 134, 137, 139, 142, 144, 147,
 MEAN = [0.5, 0.5, 0.5]
 STD = [0.5, 0.5, 0.5]
 lane_label_index_dic = ["单", "多", "白", "黄", "实线", "虚线", "实虚线", "虚实线"]
+LANE_LABEL_NUM = 8
+LANE_LABEL_INDEX_DIC = {
+    "单": 0, "单行": 0, "单列": 0,
+    "多": 1, "多行": 1, "多列": 1, "双": 1, "双行": 1, "双列": 1,
+    "白": 2, "白色": 2, "黄": 3, "黄色": 3,
+    "实": 4, "实线": 4, "左实右实": 4, "双实线": 4, "实实线": 4,
+    "虚": 5, "虚线": 5, "左虚右虚": 5, "双虚线": 5, "虚虚线": 5,
+    "实虚": 6, "实虚线": 6, "左实右虚": 6, "左实右虚线": 6,
+    "虚实": 7, "虚实线": 7, "左虚右实": 7, "左虚右实线": 7,
+}
 
 XMEDIA_SVP_LANE_MAX_NUM = 4 # 最大车道数
 XMEDIA_SVP_LANE_MAX_ROW_POINT = 58 # 每个车道的row点数
@@ -261,26 +275,55 @@ def preprocess_image(img_path, train_height, train_width, crop_ratio):
     img_transposed = np.transpose(img_normalized, (2, 0, 1))  # HWC -> CHW
     return img_transposed, h, w
 
-def collect_images(data_root):
-    """
-    """
+def collect_images(data_root, mode='video', test_txt_path=None):
+    """收集待处理图片；eval 模式按 test.txt 顺序读取。"""
     image_paths = []
+    if mode == 'eval':
+        if not test_txt_path or not os.path.exists(test_txt_path):
+            print(f"❌ eval 模式需要有效的 --test_txt: {test_txt_path}")
+            return image_paths
+        with open(test_txt_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                rel_path = line.strip()
+                if not rel_path:
+                    continue
+                full_path = os.path.normpath(os.path.join(data_root, rel_path))
+                if os.path.exists(full_path):
+                    image_paths.append(full_path)
+                else:
+                    print(f"⚠️ 图片不存在，跳过: {full_path}")
+        print(f"✅ 从 test.txt 加载 {len(image_paths)} 张图片")
+        return image_paths
+
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+    json_files = []
     for file_path in glob.glob(os.path.join(data_root, "**", "*"), recursive=True):
         ext = os.path.splitext(file_path)[1].lower()
         if ext in image_extensions:
             image_paths.append(file_path)
+        elif mode == 'json' and ext == '.json':
+            json_files.append(file_path)
+    if mode == 'json':
+        for json_path in tqdm(json_files, desc='清理旧JSON', disable=not json_files):
+            try:
+                os.remove(json_path)
+            except OSError as exc:
+                print(f"⚠️ 无法删除 {json_path}: {exc}")
     print(f"✅ 共找到 {len(image_paths)} 张图片")
     return image_paths
 
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='ONNX车道线检测推理')
+    parser.add_argument('--mode', default='json', choices=['json', 'video', 'eval', 'move'], help='json=保存坐标, video=生成视频, eval=计算Loss, move=比较标注并移动异常数据')
     parser.add_argument('--onnx_model', type=str, default="../model/output_model.onnx", help='ONNX模型文件路径')
-    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose/images2", help='图片目录路径')
+    parser.add_argument('--demo_data_root', type=str, default="../../../data/dispose", help='图片目录路径')
+    parser.add_argument('--test_txt', type=str, default="../../../data/model_use/TUSimple/test.txt", help='eval 图片列表')
+    parser.add_argument('--cache_path', type=str, default="../../../data/model_use/TUSimple/tusimple_anno_cache_test.json", help='eval GT 缓存')
     parser.add_argument('--train_height', type=int, default=288, help='模型输入高度')
     parser.add_argument('--train_width', type=int, default=640, help='模型输入宽度')
     parser.add_argument('--crop_ratio', type=float, default=0.8, help='裁剪比例')
+    parser.add_argument('--batch_size', type=int, default=1, help='json/eval/move 推理 batch size')
     parser.add_argument('--save_path', type=str, default='./test_results/', help='结果保存路径')
     parser.add_argument('--fps', type=float, default=1.0, help='视频帧率')
     return parser.parse_args()
@@ -343,11 +386,13 @@ def softmax_np(x):
     e_x = np.exp(x - np.max(x))
     return e_x / e_x.sum()
 
-def pred2coords(pred, local_width=5, train_width=640):
+def pred2coords(pred, local_width=5, train_width=640,
+                original_image_widths=None, original_image_heights=None):
     """
     预测结果转坐标
     :param pred: ONNX输出的字典
-    :param train_width: 模型输入宽度
+    这是所有模式唯一的坐标解析入口。视频模式使用全局 ROW_* 结果，
+    JSON/move 模式使用返回的原图坐标，二者来自同一次解析。
     """
     loc_row = find_output_key(pred, 'loc_row')
     exist_row = find_output_key(pred, 'exist_row')
@@ -376,7 +421,14 @@ def pred2coords(pred, local_width=5, train_width=640):
     lane_label = (lane_label_prob > 0.5).astype(np.uint8)
 
     row_lane_idx = [0, 1, 2, 3]
+    model_height = 360.0
+    all_coords = [[] for _ in range(batch_size)]
+    all_lane_labels = [{} for _ in range(batch_size)]
+    all_scores = [[] for _ in range(batch_size)]
     for b in range(batch_size):
+        coords = []
+        labels = {str(i): [] for i in row_lane_idx}
+        scores = []
         for i in row_lane_idx:
             tmp = []
             if valid_row[b, :, i].sum() > 0:
@@ -394,16 +446,36 @@ def pred2coords(pred, local_width=5, train_width=640):
                         y_val = ROW_COORDS[k]
                         tmp.append((k, out_tmp, y_val, valid_prob[b, k, i]))
             if len(tmp) <= 6:
+                coords.append([])
+                scores.append([])
                 continue
 
-            LANE_POINT_NUM[i] = len(tmp)
+            # ROW_* 只有一帧缓存，仅对 batch=1 的视频模式有意义。
+            if batch_size == 1:
+                LANE_POINT_NUM[i] = len(tmp)
             for coord in tmp:
-                ROW_RESULT[i, int(coord[0])] = coord[1], coord[2], coord[3]
-                ROW_MASK[i, int(coord[0])] = 1
+                if batch_size == 1:
+                    ROW_RESULT[i, int(coord[0])] = coord[1], coord[2], coord[3]
+                    ROW_MASK[i, int(coord[0])] = 1
 
             for tmp_n in range(len(lane_label_index_dic)):
                 if lane_label[b, i, tmp_n]:
-                    LANE_LABEL_RESULT[i, tmp_n] = 1
+                    labels[str(i)].append(lane_label_index_dic[tmp_n])
+                    if batch_size == 1:
+                        LANE_LABEL_RESULT[i, tmp_n] = 1
+
+            if original_image_widths is None or original_image_heights is None:
+                lane_coords = [(float(x), int(y)) for _, x, y, _ in tmp]
+            else:
+                scale_x = float(original_image_widths[b]) / float(train_width)
+                scale_y = float(original_image_heights[b]) / model_height
+                lane_coords = [(int(x * scale_x), int(y * scale_y)) for _, x, y, _ in tmp]
+            coords.append(lane_coords)
+            scores.append([float(score) for _, _, _, score in tmp])
+        all_coords[b] = coords
+        all_lane_labels[b] = labels
+        all_scores[b] = scores
+    return all_coords, all_lane_labels, all_scores
 
 
 def weighted_line_fit(points, robust_iterations=3):
@@ -1879,6 +1951,386 @@ def lane_post_optimize(H, original_width, original_height, model_width, model_he
         measurements, filtered_lanes, topology_valid
     )
 
+def douglas_peucker(points, epsilon):
+    """用 Douglas-Peucker 简化 JSON 中的车道线折线。"""
+    if len(points) <= 2:
+        return points
+    start, end = points[0], points[-1]
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    max_distance, max_index = 0.0, 0
+    for index, (px, py) in enumerate(points[1:-1], start=1):
+        if length_sq == 0:
+            distance = math.hypot(px - start[0], py - start[1])
+        else:
+            ratio = np.clip(((px - start[0]) * dx + (py - start[1]) * dy) / length_sq, 0, 1)
+            distance = math.hypot(px - (start[0] + ratio * dx), py - (start[1] + ratio * dy))
+        if distance > max_distance:
+            max_distance, max_index = distance, index
+    if max_distance <= epsilon:
+        return [start, end]
+    left = douglas_peucker(points[:max_index + 1], epsilon)
+    right = douglas_peucker(points[max_index:], epsilon)
+    return left[:-1] + right
+
+
+def process_single_image_json(img_path, coords, lane_labels, img_h, img_w, need_base64=True):
+    """生成 LabelMe 格式的车道线 JSON。"""
+    data = {
+        'version': '5.5.0', 'flags': {}, 'shapes': [],
+        'imagePath': os.path.basename(img_path),
+        'imageHeight': img_h, 'imageWidth': img_w,
+    }
+    if need_base64:
+        image = cv2.imread(img_path)
+        if image is not None:
+            ok, buffer = cv2.imencode('.jpg', image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if ok:
+                data['imageData'] = base64.b64encode(buffer).decode('utf-8')
+    for lane_idx, lane in enumerate(coords):
+        if not lane:
+            continue
+        points = sorted([list(point) for point in lane], key=lambda point: point[1])
+        if len(points) > 2:
+            points = douglas_peucker(points, epsilon=3.5)
+        data['shapes'].append({
+            'label': ' '.join(lane_labels.get(str(lane_idx), [])) or ' ',
+            'points': points, 'group_id': lane_idx + 1, 'description': '',
+            'shape_type': 'linestrip', 'flags': {}, 'mask': None,
+        })
+    return data
+
+
+def prepare_batch(image_paths, args, require_json=False):
+    """预处理一个 batch，并跳过损坏图片或缺少标注的样本。"""
+    arrays, valid_paths, widths, heights, json_paths = [], [], [], [], []
+    for image_path in image_paths:
+        json_path = os.path.splitext(image_path)[0] + '.json'
+        if require_json and not os.path.exists(json_path):
+            continue
+        array, height, width = preprocess_image(
+            image_path, args.train_height, args.train_width, args.crop_ratio
+        )
+        if array is None:
+            print(f"⚠️ 无法读取，跳过: {image_path}")
+            continue
+        arrays.append(array)
+        valid_paths.append(image_path)
+        widths.append(width)
+        heights.append(height)
+        json_paths.append(json_path)
+    return arrays, valid_paths, widths, heights, json_paths
+
+
+def run_json_mode(session, input_name, output_names, image_list, args):
+    """JSON 模式：仅使用 pred2coords 的原始模型坐标。"""
+    total_batches = math.ceil(len(image_list) / args.batch_size)
+    for start in tqdm(range(0, len(image_list), args.batch_size), total=total_batches, desc='生成JSON'):
+        batch = image_list[start:start + args.batch_size]
+        arrays, paths, widths, heights, _ = prepare_batch(batch, args)
+        if not arrays:
+            continue
+        pred = onnx_inference(session, input_name, output_names, np.stack(arrays).astype(np.float32))
+        coords, labels, _ = pred2coords(
+            pred, train_width=args.train_width,
+            original_image_widths=widths, original_image_heights=heights,
+        )
+        for index, image_path in enumerate(paths):
+            output_path = os.path.splitext(image_path)[0] + '.json'
+            data = process_single_image_json(
+                image_path, coords[index], labels[index], heights[index], widths[index]
+            )
+            with open(output_path, 'w', encoding='utf-8') as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+    print("✅ JSON模式处理完成!")
+
+
+def parse_labelme_lane_annotation(json_path):
+    """读取 LabelMe 车道坐标和属性，均按 group_id 固定为 4 条车道。"""
+    with open(json_path, 'r', encoding='utf-8') as file:
+        data = json.load(file)
+    coords = [[] for _ in range(XMEDIA_SVP_LANE_MAX_NUM)]
+    labels = {str(i): [] for i in range(XMEDIA_SVP_LANE_MAX_NUM)}
+    for shape in data.get('shapes', []):
+        if shape.get('shape_type') != 'linestrip':
+            continue
+        group_id = shape.get('group_id')
+        points = shape.get('points')
+        if group_id not in (1, 2, 3, 4) or not points or len(points) < 2:
+            raise ValueError(f'无效车道标注: group_id={group_id}')
+        try:
+            coords[group_id - 1] = [(int(point[0]), int(point[1])) for point in points]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError(f'车道 {group_id} 包含无效坐标') from exc
+        parts = [part for part in re.split(r'[,\s，]+', shape.get('label', '').strip()) if part]
+        if len(parts) != 3:
+            raise ValueError(f'车道 {group_id} 标签应包含3个属性: {parts}')
+        vector = [0] * LANE_LABEL_NUM
+        for part in parts:
+            if part not in LANE_LABEL_INDEX_DIC:
+                raise ValueError(f'未知车道属性: {part}')
+            vector[LANE_LABEL_INDEX_DIC[part]] = 1
+        labels[str(group_id - 1)] = [
+            lane_label_index_dic[index] for index, enabled in enumerate(vector) if enabled
+        ]
+    return coords, labels
+
+
+def parse_labelme_lane_labels(json_path):
+    """读取 LabelMe 车道属性，返回固定 4 条车道的标签。"""
+    _, labels = parse_labelme_lane_annotation(json_path)
+    return labels
+
+
+def _find_bracket_index(sorted_ys, target_y):
+    """在排序后的 y 坐标中找到 target_y 所在区间的左索引。"""
+    left, right = 0, len(sorted_ys) - 2
+    while left <= right:
+        middle = (left + right) // 2
+        if sorted_ys[middle] <= target_y <= sorted_ys[middle + 1]:
+            return middle
+        if target_y < sorted_ys[middle]:
+            right = middle - 1
+        else:
+            left = middle + 1
+    return None
+
+
+def check_coord_deviation(ground_truth_coords, predicted_coords, threshold=40):
+    """以人工标注曲线为基准；任一模型预测点横向偏差超限即返回 True。"""
+    num_lanes = min(len(ground_truth_coords), len(predicted_coords))
+    for lane_index in range(num_lanes):
+        gt_pts = ground_truth_coords[lane_index]
+        pred_pts = predicted_coords[lane_index]
+
+        if not gt_pts and not pred_pts:
+            continue
+        if len(gt_pts) < 2 or not pred_pts:
+            return True
+
+        gt_sorted = sorted(gt_pts, key=lambda point: point[1])
+        gt_ys = [point[1] for point in gt_sorted]
+        gt_xs = [point[0] for point in gt_sorted]
+
+        for px, py in pred_pts:
+            if py < gt_ys[0] or py > gt_ys[-1]:
+                return True
+
+            bracket_index = _find_bracket_index(gt_ys, py)
+            if bracket_index is None:
+                return True
+
+            y0, y1 = gt_ys[bracket_index], gt_ys[bracket_index + 1]
+            x0, x1 = gt_xs[bracket_index], gt_xs[bracket_index + 1]
+            if y1 == y0:
+                gt_x = (x0 + x1) / 2.0
+            else:
+                ratio = (py - y0) / (y1 - y0)
+                gt_x = x0 + ratio * (x1 - x0)
+
+            if abs(px - gt_x) > threshold:
+                return True
+
+    return False
+
+
+def compare_json_coords(json_path, coords, predicted_labels):
+    """比较车道属性和坐标；任一不一致都视为 move 异常数据。"""
+    try:
+        ground_truth_coords, ground_truth_labels = parse_labelme_lane_annotation(json_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"⚠️ {json_path}: {exc}")
+        return True
+    if predicted_labels != ground_truth_labels:
+        return True
+    return check_coord_deviation(ground_truth_coords, coords)
+
+
+def run_move_mode(session, input_name, output_names, image_list, args):
+    """MOVE 模式：将不匹配的图片及 JSON 移到 save_path。"""
+    os.makedirs(args.save_path, exist_ok=True)
+    total_batches = math.ceil(len(image_list) / args.batch_size)
+    moved = 0
+    for start in tqdm(range(0, len(image_list), args.batch_size), total=total_batches, desc='比较并移动'):
+        arrays, paths, widths, heights, json_paths = prepare_batch(image_list[start:start + args.batch_size], args, require_json=True)
+        if not arrays:
+            continue
+        pred = onnx_inference(session, input_name, output_names, np.stack(arrays).astype(np.float32))
+        coords, labels, _ = pred2coords(pred, train_width=args.train_width, original_image_widths=widths, original_image_heights=heights)
+        for index, image_path in enumerate(paths):
+            if compare_json_coords(json_paths[index], coords[index], labels[index]):
+                shutil.move(image_path, os.path.join(args.save_path, os.path.basename(image_path)))
+                shutil.move(json_paths[index], os.path.join(args.save_path, os.path.basename(json_paths[index])))
+                moved += 1
+    print(f"✅ MOVE模式处理完成，移动 {moved} 组文件!")
+
+
+def log_softmax_np(values, axis):
+    shifted = values - np.max(values, axis=axis, keepdims=True)
+    return shifted - np.log(np.sum(np.exp(shifted), axis=axis, keepdims=True))
+
+
+def softmax_axis_np(values, axis):
+    return np.exp(log_softmax_np(values, axis))
+
+
+def smooth_l1_loss_np(prediction, target, beta=1.0):
+    difference = np.abs(prediction - target)
+    return np.where(difference < beta, 0.5 * difference ** 2 / beta, difference - 0.5 * beta)
+
+
+def softmax_focal_loss_np(logits, labels, gamma=2, ignore_index=-1):
+    """与训练代码 soft target 一致的 focal loss。"""
+    _, classes, _, _ = logits.shape
+    log_score = (1.0 - softmax_axis_np(logits, axis=1)) ** gamma * log_softmax_np(logits, axis=1)
+    invalid = labels == ignore_index
+
+    def one_hot(indices):
+        result = np.zeros(indices.shape + (classes,), dtype=np.float32)
+        valid = (indices >= 0) & (indices < classes)
+        positions = np.nonzero(valid)
+        result[positions + (indices[valid].astype(np.int64),)] = 1.0
+        return np.transpose(result, (0, 3, 1, 2))
+
+    center = labels.copy()
+    center[invalid] = classes
+    left, right = labels - 1, labels + 1
+    left[invalid | (left == -1)] = classes
+    right[invalid | (right == classes)] = classes
+    support_left, support_right = labels.copy(), labels.copy()
+    support_left[labels != 0] = classes
+    support_right[labels != classes - 1] = classes
+    target = (0.9 * one_hot(center) + 0.05 * one_hot(left) + 0.05 * one_hot(right)
+              + 0.05 * one_hot(support_left) + 0.05 * one_hot(support_right))
+    valid_count = np.sum(~invalid)
+    return 0.0 if valid_count == 0 else float(-np.sum(target * log_score) / valid_count)
+
+
+def cross_entropy_np(logits, labels):
+    log_probs = log_softmax_np(logits, axis=1)
+    selected = np.take_along_axis(log_probs, np.expand_dims(labels.astype(np.int64), 1), axis=1)
+    return float(-np.mean(selected))
+
+
+def mean_loss_np(logits, labels):
+    classes = logits.shape[1]
+    grid = np.arange(classes, dtype=np.float32).reshape(1, classes, 1, 1)
+    prediction = np.sum(softmax_axis_np(logits, axis=1) * grid, axis=1)
+    valid = labels != -1
+    return 0.0 if not np.any(valid) else float(np.mean(smooth_l1_loss_np(prediction, labels)[valid]))
+
+
+def bce_with_logits_loss_np(logits, targets):
+    logits = logits.astype(np.float64)
+    targets = targets.astype(np.float64)
+    return float(np.mean(np.maximum(logits, 0) - logits * targets + np.log1p(np.exp(-np.abs(logits)))))
+
+
+def compute_test_loss(pred, target):
+    """计算 cls/exist/mean/lane-attribute loss，不调用视频后处理。"""
+    loc_row = find_output_key(pred, 'loc_row')
+    exist_row = find_output_key(pred, 'exist_row')
+    lane_label = find_output_key(pred, 'lane_label')
+    labels_row = target['labels_row']
+    items = {
+        'cls_loss': softmax_focal_loss_np(loc_row, labels_row),
+        'cls_ext': cross_entropy_np(exist_row, (labels_row != -1).astype(np.int64)),
+        'mean_loss_row': mean_loss_np(loc_row, labels_row),
+        'lane_attr_loss': bce_with_logits_loss_np(lane_label, target['lane_label']),
+    }
+    items['total_loss'] = sum(items.values())
+    return items['total_loss'], items
+
+
+def my_interp_cpu(points, interpolation_locations, direction=0):
+    """在固定 row anchor 上线性插值 GT 坐标。"""
+    lane_num = points.shape[0]
+    output = np.full((lane_num, len(interpolation_locations), 2), -1.0, dtype=np.float32)
+    inverse_direction = 1 - direction
+    for lane_idx, lane in enumerate(points):
+        for anchor_idx, location in enumerate(interpolation_locations):
+            output[lane_idx, anchor_idx, inverse_direction] = location
+            for point_idx in range(len(lane) - 1, 0, -1):
+                first, second = lane[point_idx], lane[point_idx - 1]
+                if np.any(first < 0) or np.any(second < 0):
+                    continue
+                first_inv, second_inv = first[inverse_direction], second[inverse_direction]
+                if (first_inv - location) * (second_inv - location) > 0:
+                    continue
+                length = abs(first_inv - second_inv)
+                if length < 1e-6:
+                    break
+                first_weight = 1.0 - abs(first_inv - location) / length
+                output[lane_idx, anchor_idx, direction] = (
+                    first[direction] * first_weight + second[direction] * (1.0 - first_weight)
+                )
+                break
+    return output
+
+
+def load_gt_labels(image_list, data_root, cache_path, num_cell_row):
+    with open(cache_path, 'r', encoding='utf-8') as file:
+        cached_points = json.load(file)
+    labels = {}
+    for image_path in tqdm(image_list, desc='加载GT'):
+        relative_path = os.path.relpath(image_path, data_root)
+        key = relative_path if relative_path in cached_points else os.path.basename(image_path)
+        if key not in cached_points:
+            print(f"⚠️ GT缓存中不存在: {relative_path}")
+            continue
+        image = cv2.imread(image_path)
+        if image is None:
+            continue
+        image_width = image.shape[1]
+        info = cached_points[key]
+        points = np.asarray(info['points'], dtype=np.float32)
+        interpolated = my_interp_cpu(points, ROW_COORDS, direction=0)[:, :, 0].T
+        labels_row = (interpolated / image_width * (num_cell_row - 1)).astype(np.int64)
+        invalid = (interpolated < 0) | (interpolated > image_width)
+        labels_row[invalid | (labels_row < 0) | (labels_row >= num_cell_row)] = -1
+        labels[image_path] = {
+            'labels_row': labels_row,
+            'lane_label': np.asarray(info['lane_label'], dtype=np.float32),
+        }
+    return labels
+
+
+def run_eval_mode(session, input_name, output_names, image_list, args):
+    """EVAL 模式：只计算测试集 loss，不调用任何车道后处理。"""
+    dummy = onnx_inference(
+        session, input_name, output_names,
+        np.zeros((1, 3, args.train_height, args.train_width), dtype=np.float32),
+    )
+    num_cell_row = find_output_key(dummy, 'loc_row').shape[1]
+    gt_labels = load_gt_labels(image_list, args.demo_data_root, args.cache_path, num_cell_row)
+    valid_images = [path for path in image_list if path in gt_labels]
+    if not valid_images:
+        print("❌ 没有找到匹配的GT标签")
+        return
+    totals = {key: 0.0 for key in ('total_loss', 'cls_loss', 'cls_ext', 'mean_loss_row', 'lane_attr_loss')}
+    sample_count = 0
+    for start in tqdm(range(0, len(valid_images), args.batch_size), desc='计算Loss'):
+        arrays, paths, _, _, _ = prepare_batch(valid_images[start:start + args.batch_size], args)
+        if not arrays:
+            continue
+        pred = onnx_inference(session, input_name, output_names, np.stack(arrays).astype(np.float32))
+        target = {
+            'labels_row': np.stack([gt_labels[path]['labels_row'] for path in paths]),
+            'lane_label': np.stack([gt_labels[path]['lane_label'] for path in paths]),
+        }
+        _, items = compute_test_loss(pred, target)
+        batch_samples = len(paths)
+        for key in totals:
+            totals[key] += items[key] * batch_samples
+        sample_count += batch_samples
+    if sample_count == 0:
+        print("❌ 没有有效样本可用于计算Loss")
+        return
+    print(f"\nLoss统计 ({sample_count}张图片)")
+    for key, value in totals.items():
+        print(f"{key:<20} {value / sample_count:>10.4f}")
+
+
 def run_video_mode(session, input_name, output_names, image_list, args):
     """视频模式：将带车道线的图片合成视频"""
     batch_size = 1
@@ -1943,11 +2395,18 @@ def run_video_mode(session, input_name, output_names, image_list, args):
 def main():
     args = parse_args()
     session, input_name, output_names = load_onnx_model(args.onnx_model)
-    image_list = collect_images(data_root=args.demo_data_root)
+    image_list = collect_images(data_root=args.demo_data_root, mode=args.mode, test_txt_path=args.test_txt)
     if len(image_list) == 0:
         print("未找到任何图片，退出。")
         return
-    run_video_mode(session, input_name, output_names, image_list, args)
+    if args.mode == 'json':
+        run_json_mode(session, input_name, output_names, image_list, args)
+    elif args.mode == 'video':
+        run_video_mode(session, input_name, output_names, image_list, args)
+    elif args.mode == 'eval':
+        run_eval_mode(session, input_name, output_names, image_list, args)
+    elif args.mode == 'move':
+        run_move_mode(session, input_name, output_names, image_list, args)
 
 if __name__ == "__main__":
     main()
